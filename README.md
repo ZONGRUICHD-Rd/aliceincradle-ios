@@ -30,6 +30,7 @@ Unity 编辑器在 CI 中运行需要许可证（个人版免费）。在仓库 
   - Windows：`C:\ProgramData\Unity\Unity_lic.ulf`
   - macOS：`/Library/Application Support/Unity/Unity_lic.ulf`
   - Linux：`~/.local/share/unity3d/Unity/Unity_lic.ulf`
+  新版 Unity Hub 可能不生成 `.ulf`，而是生成 `%LOCALAPPDATA%\Unity\licenses\UnityEntitlementLicense.xml`，把它的全部内容填进 `UNITY_LICENSE` 也可以（CI 会自动识别格式）。
 - 或者（Pro/Plus 序列号）：`UNITY_SERIAL`、`UNITY_EMAIL`、`UNITY_PASSWORD`
 
 ### 2. 游戏文件（已就绪）

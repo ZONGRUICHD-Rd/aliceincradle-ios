@@ -17,7 +17,15 @@ cat > "$WORK/.unity_run.sh" <<EOS
 set -uo pipefail
 mkdir -p /root/.local/share/unity3d/Unity
 if [ -n "\${UNITY_LICENSE:-}" ]; then
-  printf '%s' "\$UNITY_LICENSE" > /root/.local/share/unity3d/Unity/Unity_lic.ulf
+  # Either a legacy Unity_lic.ulf or the UnityEntitlementLicense.xml newer Hubs write
+  # (Windows: %LOCALAPPDATA%\\Unity\\licenses). Install it where each licensing path looks.
+  if printf '%s' "\$UNITY_LICENSE" | grep -q 'DeveloperData'; then
+    printf '%s' "\$UNITY_LICENSE" > /root/.local/share/unity3d/Unity/Unity_lic.ulf
+  else
+    mkdir -p /root/.config/unity3d/Unity/licenses
+    printf '%s' "\$UNITY_LICENSE" > /root/.config/unity3d/Unity/licenses/UnityEntitlementLicense.xml
+    echo "Using UnityEntitlementLicense.xml"
+  fi
 elif [ -n "\${UNITY_SERIAL:-}" ]; then
   unity-editor -batchmode -nographics -quit -logFile /dev/stdout \
     -serial "\$UNITY_SERIAL" -username "\$UNITY_EMAIL" -password "\$UNITY_PASSWORD" || exit 1
