@@ -53,7 +53,51 @@ jobs:
       PYTHONUTF8: "1"
       DOTNET_CLI_TELEMETRY_OPTOUT: "1"
     steps:
-      - uses: actions/checkout@v4
+      # git fetch from github.com keeps timing out on the PC's connection, so
+      # download the commit as a zip (codeload), falling back to fetching each
+      # file from raw.githubusercontent.com
+      - name: Get source
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ws = $env:GITHUB_WORKSPACE
+          $sha = $env:GITHUB_SHA
+          $repo = $env:GITHUB_REPOSITORY
+          Get-ChildItem -LiteralPath $ws -Force | Remove-Item -Recurse -Force
+          $curl = @('-fL', '--no-progress-meter', '--retry', '5', '--retry-all-errors', '--retry-delay', '5',
+                    '--connect-timeout', '30', '--speed-limit', '1024', '--speed-time', '60')
+          $zip = Join-Path $env:RUNNER_TEMP 'source.zip'
+          $ok = $false
+          for ($i = 1; $i -le 4 -and -not $ok; $i++) {
+            Write-Host "codeload attempt $i"
+            & curl.exe @curl -m 600 -o $zip "https://codeload.github.com/$repo/zip/$sha"
+            $ok = $LASTEXITCODE -eq 0
+            if (-not $ok) { Start-Sleep -Seconds (10 * $i) }
+          }
+          if ($ok) {
+            $tmp = Join-Path $env:RUNNER_TEMP 'source'
+            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+            Expand-Archive $zip -DestinationPath $tmp
+            $top = Get-ChildItem $tmp -Directory | Select-Object -First 1
+            Get-ChildItem -LiteralPath $top.FullName -Force | Move-Item -Destination $ws
+            Remove-Item $tmp, $zip -Recurse -Force
+          } else {
+            Write-Host 'codeload failed, fetching files from raw.githubusercontent.com'
+            $tree = Join-Path $env:RUNNER_TEMP 'tree.json'
+            & curl.exe @curl -H "Authorization: Bearer $env:GITHUB_TOKEN" -o $tree "https://api.github.com/repos/$repo/git/trees/${sha}?recursive=1"
+            if ($LASTEXITCODE -ne 0) { throw 'could not list repository files' }
+            $files = (Get-Content $tree -Raw | ConvertFrom-Json).tree | Where-Object { $_.type -eq 'blob' }
+            foreach ($f in $files) {
+              $dest = Join-Path $ws ($f.path -replace '/', '\')
+              New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
+              $path = ($f.path -split '/' | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/'
+              & curl.exe @curl -o $dest "https://raw.githubusercontent.com/$repo/$sha/$path"
+              if ($LASTEXITCODE -ne 0) { throw "download failed: $($f.path)" }
+            }
+          }
+          if (-not (Test-Path (Join-Path $ws '.github\workflows\build-ios.yml'))) { throw 'source download incomplete' }
+          Write-Host "source at $sha"
 
       - name: Environment
         run: |
