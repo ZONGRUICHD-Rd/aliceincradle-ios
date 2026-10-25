@@ -231,7 +231,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           python tools/ci/prepare_project.py --export "$env:WORK\export\ExportedProject" --project "$env:WORK\unity" --game-data "$env:GAME_DATA" --dlls "$env:WORK\dlls" --shaders "$env:WORK\shaders" --work "$env:WORK\prep"
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          Remove-Item "$env:WORK\export", "$env:WORK\assetripper", "$env:WORK\ar.zip" -Recurse -Force
+          Remove-Item "$env:WORK\export", "$env:WORK\assetripper" -Recurse -Force -ErrorAction SilentlyContinue
           $builtin = Join-Path (Split-Path $env:UNITY) 'Data\Resources\PackageManager\BuiltInPackages'
           $asms = Get-Content "$env:WORK\prep\package_assemblies.txt" | Where-Object { $_ }
           dotnet "$env:WORK\porttool\PortTool.dll" remap-scripts "$env:WORK\unity\Assets" "$env:WORK\unity\Library\PackageCache;$builtin" @asms

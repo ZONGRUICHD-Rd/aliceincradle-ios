@@ -12,6 +12,9 @@ function Quote([string]$a) { if ($a -match '[\s"]') { '"' + ($a -replace '"', '\
 $argLine = (@('-batchmode', '-nographics', '-logFile', $Log) + $UnityArgs | ForEach-Object { Quote $_ }) -join ' '
 Write-Host "> $Unity $argLine"
 $p = Start-Process -FilePath $Unity -ArgumentList $argLine -PassThru -NoNewWindow
+# Windows PowerShell only reports ExitCode if the handle was opened while the
+# process was running
+$null = $p.Handle
 $pattern = '\[IOSPort\]|error CS|Exception|Error building|Build (succeeded|failed)|Aborting batchmode|license|License|Importing|Compiling|Exiting'
 $pos = 0
 while (-not $p.HasExited) {
@@ -30,5 +33,6 @@ if (Test-Path $Log) {
   if ($lines.Count -gt $pos) { $lines[$pos..($lines.Count - 1)] | Where-Object { $_ -match $pattern } | ForEach-Object { Write-Host $_ } }
 }
 $code = $p.ExitCode
+if ($null -eq $code) { Write-Host 'Unity exit code unavailable'; $code = 1 }
 Write-Host "Unity exited with code $code"
 exit $code
