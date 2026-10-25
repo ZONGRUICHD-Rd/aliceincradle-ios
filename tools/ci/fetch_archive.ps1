@@ -28,10 +28,19 @@ $base = "https://raw.githubusercontent.com/$Repo/$Branch/archive"
 # (private repository)
 $script:auth = @()
 
+# Get-FileHash is missing when the runner's PSModulePath points at PowerShell 7
+# modules, so hash with .NET directly
+function Get-Sha256([string]$path) {
+  $sha = [Security.Cryptography.SHA256]::Create()
+  $fs = [IO.File]::OpenRead($path)
+  try { return ([BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-', '').ToLower() }
+  finally { $fs.Dispose(); $sha.Dispose() }
+}
+
 function Get-File([string]$name, [string]$expected) {
   $dest = Join-Path $Out $name
   for ($attempt = 1; $attempt -le 8; $attempt++) {
-    if ($expected -and (Test-Path $dest) -and ((Get-FileHash $dest -Algorithm SHA256).Hash.ToLower() -eq $expected)) {
+    if ($expected -and (Test-Path $dest) -and ((Get-Sha256 $dest) -eq $expected)) {
       Write-Host "  $name ok"
       return $dest
     }
@@ -49,7 +58,7 @@ function Get-File([string]$name, [string]$expected) {
       continue
     }
     if (-not $expected) { return $dest }
-    if ((Get-FileHash $dest -Algorithm SHA256).Hash.ToLower() -eq $expected) { Write-Host "  $name ok"; return $dest }
+    if ((Get-Sha256 $dest) -eq $expected) { Write-Host "  $name ok"; return $dest }
     Write-Host "  checksum mismatch for $name, downloading again"
     Remove-Item $dest -Force
   }
@@ -65,7 +74,7 @@ $parts = $entries | Where-Object { $_.Name -match '\.part\d+$' } | Sort-Object N
 if (-not $whole -or -not $parts) { throw 'SHA256SUMS has an unexpected format' }
 
 $archive = Join-Path $Out $whole.Name
-if ((Test-Path $archive) -and ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() -eq $whole.Hash)) {
+if ((Test-Path $archive) -and ((Get-Sha256 $archive) -eq $whole.Hash)) {
   Write-Host "cached archive ok: $archive"
   Write-Output $archive
   exit 0
@@ -81,7 +90,7 @@ try {
   }
 } finally { $fs.Dispose() }
 foreach ($p in $parts) { Remove-Item (Join-Path $Out $p.Name) }
-$hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+$hash = Get-Sha256 $archive
 if ($hash -ne $whole.Hash) { throw "archive checksum mismatch: $hash" }
 Write-Host "archive ok: $archive"
 Write-Output $archive
