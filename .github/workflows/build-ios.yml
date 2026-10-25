@@ -1,0 +1,232 @@
+name: Build iOS (unsigned IPA)
+
+# Ports the Windows build of AliceInCradle to iOS (Metal, IL2CPP arm64).
+# The game files are never stored in this repository: they are downloaded
+# from GAME_ARCHIVE_URL at build time.
+#
+# Required secrets:
+#   GAME_ARCHIVE_URL   direct link (or UGREEN share link) to the Windows .7z/.zip
+#   UNITY_LICENSE      contents of Unity_lic.ulf            -- or --
+#   UNITY_SERIAL, UNITY_EMAIL, UNITY_PASSWORD (serial based activation)
+# Optional repository variables:
+#   IOS_BUNDLE_ID      application identifier (default com.aliceincradle.iosport)
+#   IOS_VERSION        CFBundleShortVersionString (default 0.30.9)
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_url:
+        description: "Game archive URL (overrides the GAME_ARCHIVE_URL secret)"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+
+concurrency:
+  group: build-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UNITY_IMAGE: unityci/editor:ubuntu-2022.3.62f2-ios-3.2.2
+  ASSETRIPPER_VERSION: 1.3.14
+  BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID || 'com.aliceincradle.iosport' }}
+  APP_VERSION: ${{ vars.IOS_VERSION || '0.30.9' }}
+
+jobs:
+  unity:
+    name: Port game & generate Xcode project
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    env:
+      GAME_URL: ${{ inputs.game_url || secrets.GAME_ARCHIVE_URL }}
+      UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+      UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+      UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+      UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+    steps:
+      - name: Check configuration
+        run: |
+          ok=1
+          if [ -z "$GAME_URL" ]; then
+            echo "::error::Set the GAME_ARCHIVE_URL secret (or pass game_url) to a download link of the Windows build."
+            ok=0
+          fi
+          if [ -z "$UNITY_LICENSE" ] && [ -z "$UNITY_SERIAL" ]; then
+            echo "::error::Set UNITY_LICENSE (Unity_lic.ulf contents) or UNITY_SERIAL/UNITY_EMAIL/UNITY_PASSWORD secrets."
+            ok=0
+          fi
+          [ "$ok" = 1 ]
+
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/swift \
+            /usr/local/share/powershell /opt/hostedtoolcache/CodeQL /usr/local/share/chromium \
+            /opt/microsoft /opt/google /usr/lib/jvm || true
+          sudo docker image prune -af || true
+          sudo mkdir -p /mnt/work && sudo chown "$(id -u):$(id -g)" /mnt/work
+          echo "WORK=/mnt/work" >> "$GITHUB_ENV"
+          df -h / /mnt
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full zstd glslang-tools >/dev/null
+          pip install -q -r tools/requirements.txt
+
+      - name: Pull Unity editor image
+        run: docker pull -q "$UNITY_IMAGE"
+
+      - name: Download game
+        run: |
+          GAME_ROOT=$(tools/ci/download_game.sh "$GAME_URL" "$WORK/dl")
+          GAME_DATA=$(ls -d "$GAME_ROOT"/*_Data | head -1)
+          echo "GAME_ROOT=$GAME_ROOT" >> "$GITHUB_ENV"
+          echo "GAME_DATA=$GAME_DATA" >> "$GITHUB_ENV"
+          du -sh "$GAME_ROOT"
+          cat "$GAME_DATA/app.info"; echo
+
+      - name: Build managed replacements (CRI audio, file dialogs) and tools
+        run: |
+          dotnet build managed/CriMw.CriWare.Runtime -c Release -p:UnityManaged="$GAME_DATA/Managed" -o "$WORK/dlls"
+          dotnet build managed/SFB -c Release -o "$WORK/dlls"
+          dotnet build tools/PortTool -c Release -o "$WORK/porttool"
+          PT="dotnet $WORK/porttool/PortTool.dll"
+          $PT md4-selftest
+          mkdir -p "$WORK/refcheck"
+          cp "$GAME_DATA"/Managed/*.dll "$WORK/refcheck/"
+          cp "$WORK/dlls/CriMw.CriWare.Runtime.dll" "$WORK/dlls/SFB.dll" "$WORK/refcheck/"
+          # every reference the game makes into the replaced assemblies must resolve
+          $PT check-refs "$WORK/refcheck" CriMw.CriWare.Runtime Assembly-CSharp unsafeAssem
+          $PT check-refs "$WORK/refcheck" SFB Assembly-CSharp unsafeAssem
+          rm -rf "$WORK/refcheck"
+
+      - name: Regenerate shaders for Metal
+        run: python tools/shaderport/port_shaders.py "$GAME_DATA" "$WORK/shaders" --check
+
+      - name: Export game project with AssetRipper
+        run: |
+          curl -fsSL -o "$WORK/ar.zip" \
+            "https://github.com/AssetRipper/AssetRipper/releases/download/$ASSETRIPPER_VERSION/AssetRipper_linux_x64.zip"
+          unzip -q "$WORK/ar.zip" -d "$WORK/assetripper"
+          tools/ci/run_assetripper.sh "$WORK/assetripper" "$GAME_ROOT" "$WORK/export"
+          df -h /mnt
+
+      - name: Resolve Unity packages
+        run: |
+          mkdir -p "$WORK/logs"
+          cp -r unity "$WORK/unity"
+          tools/ci/unity_docker.sh "$WORK" -quit -projectPath /work/unity -buildTarget iOS -logFile - \
+            2>&1 | tee "$WORK/logs/unity-resolve.log" | grep -E "error|Error|Exception" || true
+          test -d "$WORK/unity/Library/PackageCache"
+
+      - name: Merge exported game into the iOS project
+        run: |
+          python tools/ci/prepare_project.py --export "$WORK/export/ExportedProject" --project "$WORK/unity" \
+            --game-data "$GAME_DATA" --dlls "$WORK/dlls" --shaders "$WORK/shaders" --work "$WORK/prep"
+          rm -rf "$WORK/export" "$WORK/assetripper" "$WORK/ar.zip"
+          dotnet "$WORK/porttool/PortTool.dll" remap-scripts "$WORK/unity/Assets" \
+            "$WORK/unity/Library/PackageCache:$WORK/builtin_packages" $(cat "$WORK/prep/package_assemblies.txt")
+          while read -r a; do
+            rm -f "$WORK/unity/Assets/Plugins/$a.dll" "$WORK/unity/Assets/Plugins/$a.dll.meta"
+          done < "$WORK/prep/package_assemblies.txt"
+          ls "$WORK/unity/Assets" "$WORK/unity/Assets/Plugins"
+          du -sh "$WORK/unity/Assets"; df -h /mnt
+
+      - name: Unity build (iOS AssetBundles + Xcode project)
+        run: |
+          tools/ci/unity_docker.sh "$WORK" -projectPath /work/unity -buildTarget iOS \
+            -executeMethod IOSPort.EditorTools.PortBuild.Build \
+            -portManifests /work/prep/manifests -portShaderMap /work/prep/shader_map.tsv \
+            -portOutput /work/xcode -portBundleId "$BUNDLE_ID" -portVersion "$APP_VERSION" \
+            -portBuildNumber "${{ github.run_number }}" -logFile - 2>&1 | tee "$WORK/logs/unity-build.log" \
+            | grep --line-buffered -E "\[IOSPort\]|error|Exception|Build (succeeded|failed)" || true
+          test -d "$WORK/xcode/Unity-iPhone.xcodeproj"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unity-logs
+          path: |
+            /mnt/work/logs
+            /mnt/work/export.log
+            /mnt/work/shaders/index.json
+          if-no-files-found: ignore
+
+      - name: Pack Xcode project
+        run: |
+          tar -I 'zstd -T0 -3' -cf "$WORK/xcode.tar.zst" -C "$WORK" xcode
+          ls -la "$WORK/xcode.tar.zst"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcode-project
+          path: /mnt/work/xcode.tar.zst
+          compression-level: 0
+          retention-days: 2
+
+  ipa:
+    name: Build unsigned IPA (Xcode 26)
+    needs: unity
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: xcode-project
+
+      - name: Select Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Extract project
+        run: |
+          command -v zstd >/dev/null || brew install zstd
+          tar -I zstd -xf xcode.tar.zst
+          rm xcode.tar.zst
+          df -h .
+
+      - name: Archive (no code signing)
+        run: |
+          set -o pipefail
+          xcodebuild -project xcode/Unity-iPhone.xcodeproj -scheme Unity-iPhone -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -archivePath build/AliceInCradle.xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
+            ENABLE_BITCODE=NO COMPILER_INDEX_STORE_ENABLE=NO \
+            archive | tee xcodebuild.log | grep -E "error:|warning: unable|ARCHIVE (SUCCEEDED|FAILED)|\*\*" || true
+          test -d build/AliceInCradle.xcarchive/Products/Applications
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/AliceInCradle.xcarchive/Products/Applications/*.app Payload/
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Payload/*.app/Info.plist)
+          zip -qry "AliceInCradle-${VERSION}-unsigned.ipa" Payload
+          ls -la *.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AliceInCradle-unsigned-ipa
+          path: "*.ipa"
+          compression-level: 0
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log

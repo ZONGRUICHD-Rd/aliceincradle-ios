@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Replacement for the game's SFB.dll (no native dialogs on iOS). -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AssemblyName>SFB</AssemblyName>
+    <AssemblyVersion>0.0.0.0</AssemblyVersion>
+    <LangVersion>9.0</LangVersion>
+    <Deterministic>true</Deterministic>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+</Project>

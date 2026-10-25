@@ -1,0 +1,13 @@
+# Generated in CI from the game data - never commit game assets.
+/Library/
+/Temp/
+/Logs/
+/UserSettings/
+/Build/
+/obj/
+/Assets/*
+!/Assets/IOSPort/
+!/Assets/IOSPort.meta
+/ProjectSettings/*
+!/ProjectSettings/ProjectVersion.txt
+/Packages/packages-lock.json
