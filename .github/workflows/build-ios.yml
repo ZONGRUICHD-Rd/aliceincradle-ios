@@ -205,7 +205,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force logs | Out-Null
           Copy-Item "$env:WORK\logs\*" logs\ -ErrorAction SilentlyContinue
-          Copy-Item "$env:WORK\export.log" logs\ -ErrorAction SilentlyContinue
+          Copy-Item "$env:WORK\export.log", "$env:WORK\export.stdout.txt", "$env:WORK\export.stderr.txt" logs\ -ErrorAction SilentlyContinue
           Copy-Item "$env:WORK\shaders\index.json" logs\ -ErrorAction SilentlyContinue
 
       - name: Upload logs
