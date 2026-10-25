@@ -15,6 +15,7 @@ GitHub Actions 会下载游戏原始文件，重建 Unity 工程，以 **Metal +
 | 文件对话框 | SFB（user32/Windows Forms） | `managed/SFB` 空实现（仅影响小游戏的导入/导出功能） |
 | 计算着色器 | 部分效果使用 compute shader | 打开游戏自带的 `nocomputeshader` 开关，走游戏内置的像素着色器回退路径 |
 | 输入 | 键盘 / 手柄 | 触屏虚拟手柄（`unity/Assets/IOSPort/Runtime/TouchGamepad.cs`），映射为 Input System 的虚拟 Gamepad，游戏原有手柄键位直接生效；连接实体手柄（MFi/Xbox/PS）时自动隐藏 |
+| IL2CPP | 原版是 Mono，`Better.UnsafeGeneric.dll` 用手写 IL 直接比较泛型枚举值，IL2CPP 无法编译 | `PortTool fix-generic-comparers` 把这些方法改写为调用 `EqualityComparer<T>.Default`，结果相同 |
 | Unity 包 | 导出为预编译 DLL | `tools/PortTool` 把场景/资源中对 URP、Input System、UGUI 脚本的引用重映射到真正的 UPM 包源码 |
 
 存档写在 `Application.persistentDataPath`（应用的 Documents 目录），与原版逻辑相同。

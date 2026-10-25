@@ -237,6 +237,11 @@ jobs:
           dotnet "$env:WORK\porttool\PortTool.dll" remap-scripts "$env:WORK\unity\Assets" "$env:WORK\unity\Library\PackageCache;$builtin" @asms
           if ($LASTEXITCODE -ne 0) { exit 1 }
           foreach ($a in $asms) { Remove-Item "$env:WORK\unity\Assets\Plugins\$a.dll", "$env:WORK\unity\Assets\Plugins\$a.dll.meta" -ErrorAction SilentlyContinue }
+          # raw-IL generic comparers (Better.UnsafeGeneric) that IL2CPP cannot compile
+          foreach ($d in Get-ChildItem "$env:WORK\unity\Assets\Plugins" -Filter *.dll) {
+            dotnet "$env:WORK\porttool\PortTool.dll" fix-generic-comparers $d.FullName | Where-Object { $_ -notmatch ': 0 methods rewritten$' }
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
           Get-ChildItem "$env:WORK\unity\Assets\Plugins" -Filter *.dll | Select-Object Name
 
       - name: Unity build (iOS AssetBundles + Xcode project)

@@ -16,6 +16,10 @@ namespace PortTool;
 ///       (Assets/Plugins/X.dll) so they point to the package sources instead.
 ///   check-refs     &lt;dir&gt; &lt;targetAssembly&gt; &lt;asm&gt;...
 ///       Verifies every member reference into targetAssembly resolves.
+///   fix-generic-comparers &lt;dll&gt;
+///       Rewrites IEqualityComparer&lt;T&gt; methods that compare an unconstrained T
+///       with raw IL (ldarg; ldarg; ceq), which IL2CPP rejects, to call
+///       EqualityComparer&lt;T&gt;.Default instead.
 /// </summary>
 static class Program
 {
@@ -37,6 +41,7 @@ static class Program
                 return 0;
             case "remap-scripts": return RemapScripts(args[1], args[2], args.Skip(3).ToArray());
             case "check-refs": return CheckRefs(args[1], args[2], args.Skip(3).ToArray());
+            case "fix-generic-comparers": return FixGenericComparers(args[1]);
             default:
                 Console.Error.WriteLine("unknown command " + args[0]);
                 return 2;
@@ -242,5 +247,71 @@ static class Program
         }
         Console.WriteLine($"{target}: {ok} references resolved, {bad} missing");
         return bad == 0 ? 0 : 1;
+    }
+
+    static bool UsesRawGenericValue(MethodDefinition m, GenericParameter t)
+    {
+        // a parameter of type T loaded onto the stack and used directly by
+        // ceq / conv.*, i.e. T treated as its underlying primitive
+        if (!m.HasBody) return false;
+        var ins = m.Body.Instructions;
+        for (int i = 0; i + 1 < ins.Count; i++)
+        {
+            var op = ins[i].OpCode.Code;
+            if (op != Mono.Cecil.Cil.Code.Ldarg_1 && op != Mono.Cecil.Cil.Code.Ldarg_2) continue;
+            var next = ins[i + 1].OpCode.Code;
+            if (next == Mono.Cecil.Cil.Code.Ceq || ins[i + 1].OpCode.Name.StartsWith("conv.")
+                || (next == Mono.Cecil.Cil.Code.Ldarg_2 && i + 2 < ins.Count && ins[i + 2].OpCode.Code == Mono.Cecil.Cil.Code.Ceq))
+                return m.Parameters.Any(p => p.ParameterType == t);
+        }
+        return false;
+    }
+
+    static int FixGenericComparers(string dll)
+    {
+        var bytes = File.ReadAllBytes(dll);
+        var module = ModuleDefinition.ReadModule(new MemoryStream(bytes));
+        var corlib = module.TypeSystem.CoreLibrary;
+        int fixedCount = 0;
+        foreach (var type in AllTypes(module))
+        {
+            if (type.GenericParameters.Count != 1) continue;
+            var t = type.GenericParameters[0];
+            foreach (var m in type.Methods)
+            {
+                bool isEquals = m.Name == "Equals" && m.Parameters.Count == 2 && m.ReturnType.MetadataType == MetadataType.Boolean;
+                bool isHash = m.Name == "GetHashCode" && m.Parameters.Count == 1 && m.ReturnType.MetadataType == MetadataType.Int32;
+                if (!(isEquals || isHash) || !m.Parameters.All(p => p.ParameterType == t) || !UsesRawGenericValue(m, t)) continue;
+
+                // System.Collections.Generic.EqualityComparer<T>, scoped to the module's corlib
+                var open = new TypeReference("System.Collections.Generic", "EqualityComparer`1", module, corlib);
+                open.GenericParameters.Add(new GenericParameter("T", open));
+                var openSelf = new GenericInstanceType(open);
+                openSelf.GenericArguments.Add(open.GenericParameters[0]);
+                var inst = new GenericInstanceType(open);
+                inst.GenericArguments.Add(t);
+                var getDefault = new MethodReference("get_Default", openSelf, inst) { HasThis = false };
+                var call = new MethodReference(m.Name, isEquals ? module.TypeSystem.Boolean : module.TypeSystem.Int32, inst) { HasThis = true };
+                for (int i = 0; i < m.Parameters.Count; i++)
+                    call.Parameters.Add(new ParameterDefinition(open.GenericParameters[0]));
+
+                var body = m.Body;
+                body.Instructions.Clear();
+                body.Variables.Clear();
+                body.ExceptionHandlers.Clear();
+                var il = body.GetILProcessor();
+                il.Emit(Mono.Cecil.Cil.OpCodes.Call, getDefault);
+                il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_1);
+                if (isEquals) il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_2);
+                il.Emit(Mono.Cecil.Cil.OpCodes.Callvirt, call);
+                il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
+                body.MaxStackSize = 3;
+                Console.WriteLine($"  rewrote {m.FullName}");
+                fixedCount++;
+            }
+        }
+        if (fixedCount > 0) module.Write(dll);
+        Console.WriteLine($"{Path.GetFileName(dll)}: {fixedCount} methods rewritten");
+        return 0;
     }
 }
