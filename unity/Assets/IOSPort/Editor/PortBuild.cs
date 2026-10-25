@@ -78,6 +78,7 @@ namespace IOSPort.EditorTools
             WriteLinkXml();
             FixDummyShaders(Arg("-portShaderMap"));
             CheckRenderPipeline();
+            RelinkRendererFeatures();
             BuildBundles(Arg("-portManifests"));
             ConfigurePlayer();
             BuildPlayer(Arg("-portOutput", "Build/iOS"));
@@ -216,6 +217,74 @@ namespace IOSPort.EditorTools
             }
         }
 
+        // URP validates renderer features while importing, which can run before
+        // the game's feature script (unsafeAssem.dll) is usable; entries can then
+        // end up null. Re-link them from the references in the asset file.
+        static readonly System.Text.RegularExpressions.Regex FeatureRefRx =
+            new System.Text.RegularExpressions.Regex(@"^\s*-\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*([0-9a-fA-F]{32}))?");
+
+        static void RelinkRendererFeatures()
+        {
+            foreach (var guid in AssetDatabase.FindAssets("t:ScriptableRendererData"))
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                var data = AssetDatabase.LoadMainAssetAtPath(path);
+                if (data == null) continue;
+                var so = new SerializedObject(data);
+                var list = so.FindProperty("m_RendererFeatures");
+                if (list == null || !list.isArray || list.arraySize == 0) continue;
+
+                // the YAML entries under m_RendererFeatures, in order
+                var refs = new List<(long fileId, string guid)>();
+                bool inList = false;
+                foreach (var line in File.ReadAllLines(path))
+                {
+                    if (line.TrimStart().StartsWith("m_RendererFeatures:")) { inList = true; continue; }
+                    if (!inList) continue;
+                    var m = FeatureRefRx.Match(line);
+                    if (!m.Success) break;
+                    refs.Add((long.Parse(m.Groups[1].Value), m.Groups[2].Success ? m.Groups[2].Value : null));
+                }
+
+                bool changed = false;
+                for (int i = 0; i < list.arraySize; i++)
+                {
+                    var el = list.GetArrayElementAtIndex(i);
+                    if (el.objectReferenceValue == null && i < refs.Count)
+                    {
+                        var (fileId, g) = refs[i];
+                        string target = g != null ? AssetDatabase.GUIDToAssetPath(g) : path;
+                        UnityEngine.Object found = null;
+                        if (!string.IsNullOrEmpty(target))
+                        {
+                            foreach (var o in AssetDatabase.LoadAllAssetsAtPath(target))
+                            {
+                                if (o != null && AssetDatabase.TryGetGUIDAndLocalFileIdentifier(o, out string _, out long local) && local == fileId)
+                                {
+                                    found = o;
+                                    break;
+                                }
+                            }
+                        }
+                        if (found != null)
+                        {
+                            el.objectReferenceValue = found;
+                            changed = true;
+                        }
+                    }
+                    var v = el.objectReferenceValue;
+                    Log($"renderer {data.name} feature {i}: " + (v != null ? v.name + " (" + v.GetType().FullName + ")" : "MISSING"));
+                }
+                if (changed)
+                {
+                    so.ApplyModifiedPropertiesWithoutUndo();
+                    EditorUtility.SetDirty(data);
+                    Log($"re-linked renderer features of {path}");
+                }
+            }
+            AssetDatabase.SaveAssets();
+        }
+
         // ------------------------------------------------------------------
         static void BuildBundles(string manifestDir)
         {
@@ -239,7 +308,13 @@ namespace IOSPort.EditorTools
 
             var bundles = new List<(string rel, string name)>();
             var builds = new List<AssetBundleBuild>();
-            int missing = 0;
+            // Some bundles ship more than once under different paths (e.g. the
+            // Korean font in localization/ko-kr and localization/__AdditionalFonts).
+            // Unity allows an asset in one bundle only: build each asset set once
+            // and copy the result to every path.
+            var bySet = new Dictionary<string, string>();
+            var owner = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            int missing = 0, shared = 0;
             foreach (var manifest in Directory.GetFiles(manifestDir, "*.manifest", SearchOption.AllDirectories))
             {
                 string rel = Path.GetRelativePath(manifestDir, manifest).Replace('\\', '/');
@@ -270,11 +345,33 @@ namespace IOSPort.EditorTools
                     Debug.LogWarning($"[IOSPort] bundle {rel} has no assets, skipped");
                     continue;
                 }
+                assets = assets.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                string setKey = string.Join("\n", assets.Select(a => a.ToLowerInvariant()).OrderBy(a => a, StringComparer.Ordinal));
+                if (bySet.TryGetValue(setKey, out string existing))
+                {
+                    bundles.Add((rel, existing));
+                    shared++;
+                    continue;
+                }
                 string bundleName = rel.ToLowerInvariant();
-                builds.Add(new AssetBundleBuild { assetBundleName = bundleName, assetNames = assets.ToArray() });
+                // an asset already owned by another bundle stays there; this one depends on it
+                var own = new List<string>();
+                foreach (var a in assets)
+                {
+                    if (owner.TryGetValue(a, out string other))
+                        Debug.LogWarning($"[IOSPort] bundle {rel}: {a} already in {other}, left out");
+                    else
+                    {
+                        owner[a] = bundleName;
+                        own.Add(a);
+                    }
+                }
+                if (own.Count == 0) continue;
+                bySet[setKey] = bundleName;
+                builds.Add(new AssetBundleBuild { assetBundleName = bundleName, assetNames = own.ToArray() });
                 bundles.Add((rel, bundleName));
             }
-            Log($"building {builds.Count} asset bundles ({missing} manifest entries not found)");
+            Log($"building {builds.Count} asset bundles for {bundles.Count} files ({shared} duplicates, {missing} manifest entries not found)");
             string outDir = "Temp/IOSBundles";
             if (Directory.Exists(outDir)) Directory.Delete(outDir, true);
             Directory.CreateDirectory(outDir);
