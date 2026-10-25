@@ -3,7 +3,7 @@
 把 AliceInCradle Windows 版（ver030，Unity 2022.3.62f2 / URP / Mono）移植到 iOS 的构建流水线。
 GitHub Actions 会下载游戏原始文件，重建 Unity 工程，以 **Metal + IL2CPP arm64** 生成 iOS 工程，再用 **Xcode 26（iOS 26 SDK）** 打出**未签名 IPA**。
 
-> 游戏原始压缩包（ver030i，588 MB）分片存放在本仓库的 **`game-archive` 分支**（`archive/*.7z.part00..05`，附 SHA256 校验），CI 直接从该分支读取、校验并解压，不再依赖外部下载服务。`main` 分支不提交反编译代码或转换后的着色器，这些都在 CI 中现场生成。
+> 游戏原始压缩包（ver030i，588 MB）分片存放在本仓库的 **`game-archive` 分支**（`archive/*.7z.part00..05`，附 SHA256 校验），CI 用 curl 逐个分片下载（断点续传、自动重试、SHA256 校验），拼好的压缩包缓存在你电脑的 `<盘符>\aicw-cache`，以后的构建不再重复下载。`main` 分支不提交反编译代码或转换后的着色器，这些都在 CI 中现场生成。
 
 ## 移植做了什么
 
@@ -36,13 +36,14 @@ Unity 部分在**你自己的 Windows 电脑**上运行（自托管 runner），
 
 可选仓库变量（Settings → Variables）：
 - `UNITY_EXE`：若自动找不到 Unity，填 `Unity.exe` 的完整路径
+- `GAME_ARCHIVE_PATH`：电脑上（或 NAS 映射盘上）`AliceInCradle_Win_ver030i.7z` 的完整路径，例如 `Z:\AliceInCradle_Win_ver030i.7z`；设置后直接使用该文件，完全不从 GitHub 下载
 - `IOS_BUNDLE_ID`（默认 `com.aliceincradle.iosport`）、`IOS_VERSION`（默认 `0.30.9`）
 
 ## 流水线
 
 ```
 你的 Windows 电脑 (job: unity, self-hosted)
-  读取 game-archive 分支并校验解压 → 编译替代 DLL 并校验引用 → 重建着色器
+  下载 game-archive 分支的分片（或读取 GAME_ARCHIVE_PATH）并校验解压 → 编译替代 DLL 并校验引用 → 重建着色器
   → AssetRipper 导出工程 → Unity 解析包 → 合并/重映射 → Unity 构建 iOS AssetBundle 与 Xcode 工程
 GitHub macos-26 (job: ipa)
   xcodebuild archive (CODE_SIGNING_ALLOWED=NO) → Payload/*.app → .ipa

@@ -8,8 +8,9 @@ name: Build iOS (unsigned IPA)
 #                  -> Unity: iOS AssetBundles + Xcode project
 #   job "ipa"   -- GitHub-hosted macOS runner with Xcode 26: unsigned .ipa
 #
-# The Windows build is read from the `game-archive` branch of this repository
-# (archive/*.7z.part*, reassembled and checksum-verified at build time).
+# The Windows build is downloaded part by part from the `game-archive` branch
+# of this repository (archive/*.7z.part*, resumable, checksum-verified) and
+# cached in <drive>\aicw-cache on the runner, or read from GAME_ARCHIVE_PATH.
 #
 # The runner must run as the Windows user that is signed in to Unity Hub
 # (run.cmd, or the service configured with that account) so Unity finds the
@@ -17,6 +18,8 @@ name: Build iOS (unsigned IPA)
 #
 # Optional repository variables:
 #   UNITY_EXE          full path to Unity.exe if it is not found automatically
+#   GAME_ARCHIVE_PATH  path of AliceInCradle_Win_ver030i.7z on the runner (local
+#                      disk or NAS share); skips the download
 #   IOS_BUNDLE_ID      application identifier (default com.aliceincradle.iosport)
 #   IOS_VERSION        CFBundleShortVersionString (default 0.30.9)
 
@@ -51,11 +54,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/checkout@v4
-        with:
-          ref: game-archive
-          path: game-archive
-
       - name: Environment
         run: |
           $ErrorActionPreference = 'Stop'
@@ -69,6 +67,7 @@ jobs:
           if (Test-Path $work) { Remove-Item $work -Recurse -Force }
           New-Item -ItemType Directory -Force -Path $work, "$work\logs" | Out-Null
           "WORK=$work" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ARCHIVE_CACHE=$drive\aicw-cache" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           $unity = & "$env:GITHUB_WORKSPACE\tools\ci\find_unity.ps1" -Version $env:UNITY_VERSION
           if ($LASTEXITCODE -ne 0 -or -not $unity) { exit 1 }
           "UNITY=$unity" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -89,19 +88,36 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           python -m pip install -q -r tools/requirements.txt
-          Invoke-WebRequest -UseBasicParsing https://www.7-zip.org/a/7zr.exe -OutFile "$env:WORK\7zr.exe"
-          Invoke-WebRequest -UseBasicParsing "https://github.com/AssetRipper/AssetRipper/releases/download/$env:ASSETRIPPER_VERSION/AssetRipper_win_x64.zip" -OutFile "$env:WORK\ar.zip"
-          Expand-Archive "$env:WORK\ar.zip" -DestinationPath "$env:WORK\assetripper"
+          # cached next to the game archive; curl resumes interrupted downloads
+          New-Item -ItemType Directory -Force -Path "$env:ARCHIVE_CACHE" | Out-Null
+          function Fetch([string]$url, [string]$name) {
+            $dest = Join-Path $env:ARCHIVE_CACHE $name
+            if (-not (Test-Path $dest)) {
+              & curl.exe -fL --no-progress-meter --retry 10 --retry-all-errors --retry-delay 5 --connect-timeout 30 -C - -o "$dest.part" $url
+              if ($LASTEXITCODE -ne 0) { throw "download failed: $url" }
+              Move-Item "$dest.part" $dest
+            }
+            return $dest
+          }
+          Copy-Item (Fetch 'https://www.7-zip.org/a/7zr.exe' '7zr.exe') "$env:WORK\7zr.exe"
+          $ar = Fetch "https://github.com/AssetRipper/AssetRipper/releases/download/$env:ASSETRIPPER_VERSION/AssetRipper_win_x64.zip" "AssetRipper_$env:ASSETRIPPER_VERSION.zip"
+          Expand-Archive $ar -DestinationPath "$env:WORK\assetripper"
+
+      - name: Get game archive
+        env:
+          GAME_ARCHIVE_PATH: ${{ vars.GAME_ARCHIVE_PATH }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = & tools/ci/fetch_archive.ps1 -Out "$env:ARCHIVE_CACHE" -LocalPath "$env:GAME_ARCHIVE_PATH" -Repo "$env:GITHUB_REPOSITORY" | Select-Object -Last 1
+          if (-not $archive -or -not (Test-Path -LiteralPath $archive)) { throw 'game archive not available' }
+          "GAME_ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Unpack game
         run: |
           $ErrorActionPreference = 'Stop'
-          python tools/ci/assemble_archive.py game-archive/archive "$env:WORK\game.7z"
+          & "$env:WORK\7zr.exe" x -y "-o$env:WORK\game" "$env:GAME_ARCHIVE" | Out-Null
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          Remove-Item game-archive -Recurse -Force
-          & "$env:WORK\7zr.exe" x -y "-o$env:WORK\game" "$env:WORK\game.7z" | Out-Null
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          Remove-Item "$env:WORK\game.7z"
           $data = Get-ChildItem "$env:WORK\game" -Recurse -Directory -Filter '*_Data' | Select-Object -First 1
           if (-not $data) { throw 'no *_Data folder in archive' }
           "GAME_DATA=$($data.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
