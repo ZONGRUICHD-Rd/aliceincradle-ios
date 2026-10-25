@@ -11,7 +11,7 @@ namespace PortTool;
 ///
 ///   md4-selftest
 ///   script-fileid  &lt;namespace&gt; &lt;class&gt;
-///   remap-scripts  &lt;assetsDir&gt; &lt;packageDir[:packageDir...]&gt; &lt;assemblyName&gt;...
+///   remap-scripts  &lt;assetsDir&gt; &lt;packageDir[;packageDir...] (path separator)&gt; &lt;assemblyName&gt;...
 ///       Rewrites YAML references to scripts living in exported package DLLs
 ///       (Assets/Plugins/X.dll) so they point to the package sources instead.
 ///   check-refs     &lt;dir&gt; &lt;targetAssembly&gt; &lt;asm&gt;...
@@ -87,7 +87,7 @@ static class Program
     static Dictionary<string, string> IndexPackageScripts(string packageDirs)
     {
         var map = new Dictionary<string, string>();
-        var files = packageDirs.Split(':', StringSplitOptions.RemoveEmptyEntries)
+        var files = packageDirs.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
             .Where(Directory.Exists)
             .SelectMany(d => Directory.EnumerateFiles(d, "*.cs", SearchOption.AllDirectories));
         foreach (var cs in files)

@@ -1,25 +1,27 @@
 name: Build iOS (unsigned IPA)
 
 # Ports the Windows build of AliceInCradle to iOS (Metal, IL2CPP arm64).
+#
+#   job "unity" -- self-hosted Windows runner (the owner's PC, where Unity
+#                  2022.3.62f2 + iOS Build Support is installed and licensed)
+#                  game-archive branch -> AssetRipper export -> shader/audio port
+#                  -> Unity: iOS AssetBundles + Xcode project
+#   job "ipa"   -- GitHub-hosted macOS runner with Xcode 26: unsigned .ipa
+#
 # The Windows build is read from the `game-archive` branch of this repository
 # (archive/*.7z.part*, reassembled and checksum-verified at build time).
 #
-# Required secrets:
-#   UNITY_LICENSE      contents of Unity_lic.ulf            -- or --
-#   UNITY_SERIAL, UNITY_EMAIL, UNITY_PASSWORD (serial based activation)
-# Optional secret:
-#   GAME_ARCHIVE_URL   download the game from this URL instead of the game-archive branch
+# The runner must run as the Windows user that is signed in to Unity Hub
+# (run.cmd, or the service configured with that account) so Unity finds the
+# Personal license.
+#
 # Optional repository variables:
+#   UNITY_EXE          full path to Unity.exe if it is not found automatically
 #   IOS_BUNDLE_ID      application identifier (default com.aliceincradle.iosport)
 #   IOS_VERSION        CFBundleShortVersionString (default 0.30.9)
 
 on:
   workflow_dispatch:
-    inputs:
-      game_url:
-        description: "Game archive URL (optional; default: game-archive branch)"
-        required: false
-        default: ""
   push:
     branches: [main]
     paths-ignore: ["**.md", "docs/**"]
@@ -29,43 +31,51 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  UNITY_IMAGE: unityci/editor:ubuntu-2022.3.62f2-ios-3.2.2
+  UNITY_VERSION: 2022.3.62f2
   ASSETRIPPER_VERSION: 1.3.14
   BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID || 'com.aliceincradle.iosport' }}
   APP_VERSION: ${{ vars.IOS_VERSION || '0.30.9' }}
 
 jobs:
   unity:
-    name: Port game & generate Xcode project
-    runs-on: ubuntu-24.04
-    timeout-minutes: 345
+    name: Port game & generate Xcode project (Windows PC)
+    runs-on: [self-hosted, Windows]
+    timeout-minutes: 720
+    defaults:
+      run:
+        shell: powershell
     env:
-      GAME_URL: ${{ inputs.game_url || secrets.GAME_ARCHIVE_URL }}
-      UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
-      UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
-      UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
-      UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+      UNITY_EXE: ${{ vars.UNITY_EXE }}
+      PYTHONUTF8: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
     steps:
-      - name: Check configuration
-        run: |
-          ok=1
-          if [ -z "$UNITY_LICENSE" ] && [ -z "$UNITY_SERIAL" ]; then
-            echo "::error::Set UNITY_LICENSE (Unity_lic.ulf contents) or UNITY_SERIAL/UNITY_EMAIL/UNITY_PASSWORD secrets."
-            ok=0
-          fi
-          [ "$ok" = 1 ]
-
       - uses: actions/checkout@v4
 
-      - name: Free disk space
+      - uses: actions/checkout@v4
+        with:
+          ref: game-archive
+          path: game-archive
+
+      - name: Environment
         run: |
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/share/swift \
-            /usr/local/share/powershell /opt/hostedtoolcache/CodeQL /usr/local/share/chromium \
-            /opt/microsoft /opt/google /usr/lib/jvm || true
-          sudo docker image prune -af || true
-          sudo mkdir -p /mnt/work && sudo chown "$(id -u):$(id -g)" /mnt/work
-          echo "WORK=/mnt/work" >> "$GITHUB_ENV"
-          df -h / /mnt
+          $ErrorActionPreference = 'Stop'
+          whoami
+          if ((whoami) -match '^nt authority') {
+            Write-Host "::warning::The runner runs as a system account; Unity will not find your Personal license. Run the runner as your own user."
+          }
+          # short work path (Unity/AssetRipper hit MAX_PATH with deep paths)
+          $drive = Split-Path $env:GITHUB_WORKSPACE -Qualifier
+          $work = "$drive\aicw"
+          if (Test-Path $work) { Remove-Item $work -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $work, "$work\logs" | Out-Null
+          "WORK=$work" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $unity = & "$env:GITHUB_WORKSPACE\tools\ci\find_unity.ps1" -Version $env:UNITY_VERSION
+          if ($LASTEXITCODE -ne 0 -or -not $unity) { exit 1 }
+          "UNITY=$unity" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Unity: $unity"
+          $ios = Join-Path (Split-Path $unity) 'Data\PlaybackEngines\iOSSupport'
+          if (-not (Test-Path $ios)) { throw "iOS Build Support is not installed for this editor ($ios)" }
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
 
       - uses: actions/setup-python@v5
         with:
@@ -77,115 +87,109 @@ jobs:
 
       - name: Install tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq p7zip-full zstd glslang-tools >/dev/null
-          pip install -q -r tools/requirements.txt
-
-      - name: Pull Unity editor image
-        run: docker pull -q "$UNITY_IMAGE"
-
-      - name: Fetch game archive branch
-        if: env.GAME_URL == ''
-        uses: actions/checkout@v4
-        with:
-          ref: game-archive
-          path: game-archive
+          $ErrorActionPreference = 'Stop'
+          python -m pip install -q -r tools/requirements.txt
+          Invoke-WebRequest -UseBasicParsing https://www.7-zip.org/a/7zr.exe -OutFile "$env:WORK\7zr.exe"
+          Invoke-WebRequest -UseBasicParsing "https://github.com/AssetRipper/AssetRipper/releases/download/$env:ASSETRIPPER_VERSION/AssetRipper_win_x64.zip" -OutFile "$env:WORK\ar.zip"
+          Expand-Archive "$env:WORK\ar.zip" -DestinationPath "$env:WORK\assetripper"
 
       - name: Unpack game
         run: |
-          if [ -n "$GAME_URL" ]; then
-            SRC="$GAME_URL"
-          else
-            cat game-archive/archive/*.7z.part* > "$WORK/game.7z"
-            (cd game-archive/archive && head -1 SHA256SUMS | sed "s#  .*#  $WORK/game.7z#") | sha256sum -c -
-            rm -rf game-archive
-            SRC="$WORK/game.7z"
-          fi
-          GAME_ROOT=$(tools/ci/download_game.sh "$SRC" "$WORK/dl")
-          GAME_DATA=$(ls -d "$GAME_ROOT"/*_Data | head -1)
-          echo "GAME_ROOT=$GAME_ROOT" >> "$GITHUB_ENV"
-          echo "GAME_DATA=$GAME_DATA" >> "$GITHUB_ENV"
-          du -sh "$GAME_ROOT"
-          cat "$GAME_DATA/app.info"; echo
+          $ErrorActionPreference = 'Stop'
+          python tools/ci/assemble_archive.py game-archive/archive "$env:WORK\game.7z"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Remove-Item game-archive -Recurse -Force
+          & "$env:WORK\7zr.exe" x -y "-o$env:WORK\game" "$env:WORK\game.7z" | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Remove-Item "$env:WORK\game.7z"
+          $data = Get-ChildItem "$env:WORK\game" -Recurse -Directory -Filter '*_Data' | Select-Object -First 1
+          if (-not $data) { throw 'no *_Data folder in archive' }
+          "GAME_DATA=$($data.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "GAME_ROOT=$($data.Parent.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Get-Content (Join-Path $data.FullName 'app.info')
 
       - name: Build managed replacements (CRI audio, file dialogs) and tools
         run: |
-          dotnet build managed/CriMw.CriWare.Runtime -c Release -p:UnityManaged="$GAME_DATA/Managed" -o "$WORK/dlls"
-          dotnet build managed/SFB -c Release -o "$WORK/dlls"
-          dotnet build tools/PortTool -c Release -o "$WORK/porttool"
-          PT="dotnet $WORK/porttool/PortTool.dll"
-          $PT md4-selftest
-          mkdir -p "$WORK/refcheck"
-          cp "$GAME_DATA"/Managed/*.dll "$WORK/refcheck/"
-          cp "$WORK/dlls/CriMw.CriWare.Runtime.dll" "$WORK/dlls/SFB.dll" "$WORK/refcheck/"
+          $ErrorActionPreference = 'Stop'
+          dotnet build managed/CriMw.CriWare.Runtime -c Release "-p:UnityManaged=$env:GAME_DATA\Managed" -o "$env:WORK\dlls"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          dotnet build managed/SFB -c Release -o "$env:WORK\dlls"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          dotnet build tools/PortTool -c Release -o "$env:WORK\porttool"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $pt = "$env:WORK\porttool\PortTool.dll"
+          dotnet $pt md4-selftest
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          New-Item -ItemType Directory -Force "$env:WORK\refcheck" | Out-Null
+          Copy-Item "$env:GAME_DATA\Managed\*.dll" "$env:WORK\refcheck\"
+          Copy-Item "$env:WORK\dlls\CriMw.CriWare.Runtime.dll", "$env:WORK\dlls\SFB.dll" "$env:WORK\refcheck\" -Force
           # every reference the game makes into the replaced assemblies must resolve
-          $PT check-refs "$WORK/refcheck" CriMw.CriWare.Runtime Assembly-CSharp unsafeAssem
-          $PT check-refs "$WORK/refcheck" SFB Assembly-CSharp unsafeAssem
-          rm -rf "$WORK/refcheck"
+          dotnet $pt check-refs "$env:WORK\refcheck" CriMw.CriWare.Runtime Assembly-CSharp unsafeAssem
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          dotnet $pt check-refs "$env:WORK\refcheck" SFB Assembly-CSharp unsafeAssem
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Remove-Item "$env:WORK\refcheck" -Recurse -Force
 
       - name: Regenerate shaders for Metal
-        run: python tools/shaderport/port_shaders.py "$GAME_DATA" "$WORK/shaders" --check
+        run: |
+          python tools/shaderport/port_shaders.py "$env:GAME_DATA" "$env:WORK\shaders"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Export game project with AssetRipper
         run: |
-          curl -fsSL -o "$WORK/ar.zip" \
-            "https://github.com/AssetRipper/AssetRipper/releases/download/$ASSETRIPPER_VERSION/AssetRipper_linux_x64.zip"
-          unzip -q "$WORK/ar.zip" -d "$WORK/assetripper"
-          tools/ci/run_assetripper.sh "$WORK/assetripper" "$GAME_ROOT" "$WORK/export"
-          df -h /mnt
+          & tools/ci/run_assetripper.ps1 -AssetRipper "$env:WORK\assetripper" -Game "$env:GAME_ROOT" -Out "$env:WORK\export"
 
       - name: Resolve Unity packages
         run: |
-          mkdir -p "$WORK/logs"
-          cp -r unity "$WORK/unity"
-          tools/ci/unity_docker.sh "$WORK" -quit -projectPath /work/unity -buildTarget iOS -logFile - \
-            2>&1 | tee "$WORK/logs/unity-resolve.log" | grep -E "error|Error|Exception" || true
-          test -d "$WORK/unity/Library/PackageCache"
+          Copy-Item unity "$env:WORK\unity" -Recurse
+          & tools/ci/run_unity.ps1 -Unity "$env:UNITY" -Log "$env:WORK\logs\unity-resolve.log" -- -quit -projectPath "$env:WORK\unity" -buildTarget iOS
+          if (-not (Test-Path "$env:WORK\unity\Library\PackageCache")) { throw 'package resolution failed (see unity-resolve.log)' }
 
       - name: Merge exported game into the iOS project
         run: |
-          python tools/ci/prepare_project.py --export "$WORK/export/ExportedProject" --project "$WORK/unity" \
-            --game-data "$GAME_DATA" --dlls "$WORK/dlls" --shaders "$WORK/shaders" --work "$WORK/prep"
-          rm -rf "$WORK/export" "$WORK/assetripper" "$WORK/ar.zip"
-          dotnet "$WORK/porttool/PortTool.dll" remap-scripts "$WORK/unity/Assets" \
-            "$WORK/unity/Library/PackageCache:$WORK/builtin_packages" $(cat "$WORK/prep/package_assemblies.txt")
-          while read -r a; do
-            rm -f "$WORK/unity/Assets/Plugins/$a.dll" "$WORK/unity/Assets/Plugins/$a.dll.meta"
-          done < "$WORK/prep/package_assemblies.txt"
-          ls "$WORK/unity/Assets" "$WORK/unity/Assets/Plugins"
-          du -sh "$WORK/unity/Assets"; df -h /mnt
+          $ErrorActionPreference = 'Stop'
+          python tools/ci/prepare_project.py --export "$env:WORK\export\ExportedProject" --project "$env:WORK\unity" --game-data "$env:GAME_DATA" --dlls "$env:WORK\dlls" --shaders "$env:WORK\shaders" --work "$env:WORK\prep"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Remove-Item "$env:WORK\export", "$env:WORK\assetripper", "$env:WORK\ar.zip" -Recurse -Force
+          $builtin = Join-Path (Split-Path $env:UNITY) 'Data\Resources\PackageManager\BuiltInPackages'
+          $asms = Get-Content "$env:WORK\prep\package_assemblies.txt" | Where-Object { $_ }
+          dotnet "$env:WORK\porttool\PortTool.dll" remap-scripts "$env:WORK\unity\Assets" "$env:WORK\unity\Library\PackageCache;$builtin" @asms
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          foreach ($a in $asms) { Remove-Item "$env:WORK\unity\Assets\Plugins\$a.dll", "$env:WORK\unity\Assets\Plugins\$a.dll.meta" -ErrorAction SilentlyContinue }
+          Get-ChildItem "$env:WORK\unity\Assets\Plugins" -Filter *.dll | Select-Object Name
 
       - name: Unity build (iOS AssetBundles + Xcode project)
         run: |
-          tools/ci/unity_docker.sh "$WORK" -projectPath /work/unity -buildTarget iOS \
-            -executeMethod IOSPort.EditorTools.PortBuild.Build \
-            -portManifests /work/prep/manifests -portShaderMap /work/prep/shader_map.tsv \
-            -portOutput /work/xcode -portBundleId "$BUNDLE_ID" -portVersion "$APP_VERSION" \
-            -portBuildNumber "${{ github.run_number }}" -logFile - 2>&1 | tee "$WORK/logs/unity-build.log" \
-            | grep --line-buffered -E "\[IOSPort\]|error|Exception|Build (succeeded|failed)" || true
-          test -d "$WORK/xcode/Unity-iPhone.xcodeproj"
+          & tools/ci/run_unity.ps1 -Unity "$env:UNITY" -Log "$env:WORK\logs\unity-build.log" -- -projectPath "$env:WORK\unity" -buildTarget iOS -executeMethod IOSPort.EditorTools.PortBuild.Build -portManifests "$env:WORK\prep\manifests" -portShaderMap "$env:WORK\prep\shader_map.tsv" -portOutput "$env:WORK\xcode" -portBundleId "$env:BUNDLE_ID" -portVersion "$env:APP_VERSION" -portBuildNumber "${{ github.run_number }}"
+          if (-not (Test-Path "$env:WORK\xcode\Unity-iPhone.xcodeproj")) { throw 'Xcode project was not generated (see unity-build.log)' }
+
+      - name: Collect logs
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force logs | Out-Null
+          Copy-Item "$env:WORK\logs\*" logs\ -ErrorAction SilentlyContinue
+          Copy-Item "$env:WORK\export.log" logs\ -ErrorAction SilentlyContinue
+          Copy-Item "$env:WORK\shaders\index.json" logs\ -ErrorAction SilentlyContinue
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: unity-logs
-          path: |
-            /mnt/work/logs
-            /mnt/work/export.log
-            /mnt/work/shaders/index.json
+          path: logs
           if-no-files-found: ignore
 
       - name: Pack Xcode project
         run: |
-          tar -I 'zstd -T0 -3' -cf "$WORK/xcode.tar.zst" -C "$WORK" xcode
-          ls -la "$WORK/xcode.tar.zst"
+          tar -cf "$env:WORK\xcode.tar" -C "$env:WORK" xcode
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Move-Item "$env:WORK\xcode.tar" xcode.tar -Force
+          Get-Item xcode.tar | Select-Object Name, Length
 
       - uses: actions/upload-artifact@v4
         with:
           name: xcode-project
-          path: /mnt/work/xcode.tar.zst
-          compression-level: 0
+          path: xcode.tar
           retention-days: 2
 
   ipa:
@@ -208,9 +212,8 @@ jobs:
 
       - name: Extract project
         run: |
-          command -v zstd >/dev/null || brew install zstd
-          tar -I zstd -xf xcode.tar.zst
-          rm xcode.tar.zst
+          tar -xf xcode.tar
+          rm xcode.tar
           df -h .
 
       - name: Archive (no code signing)

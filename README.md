@@ -21,37 +21,30 @@ GitHub Actions 会下载游戏原始文件，重建 Unity 工程，以 **Metal +
 
 ## 使用方法
 
-### 1. 准备 Unity 许可证（必需）
+Unity 部分在**你自己的 Windows 电脑**上运行（自托管 runner），因为 Unity 个人版许可证绑定本机；Xcode 部分在 GitHub 的 macOS 服务器上运行。
 
-Unity 编辑器在 CI 中运行需要许可证（个人版免费）。在仓库 **Settings → Secrets and variables → Actions** 中添加：
+### 1. 电脑准备（已完成）
+- Unity Hub 登录并激活个人版许可证
+- 安装 Unity **2022.3.62f2** + **iOS Build Support**
+- 在仓库 Settings → Actions → Runners 添加 Windows 自托管 runner，并保持运行
+  - runner 必须以**登录 Unity Hub 的那个 Windows 用户**运行（直接运行 `run.cmd` 即可；若装成服务，需把服务账户改成你的用户），否则 Unity 找不到许可证
+  - 构建期间电脑需开机联网；磁盘需要约 25 GB 空闲空间（工作目录为 runner 所在盘的 `\aicw`）
 
-- `UNITY_LICENSE`：`Unity_lic.ulf` 文件的完整内容。
-  在自己电脑上用 Unity Hub 登录并激活个人版许可证后，文件位于：
-  - Windows：`C:\ProgramData\Unity\Unity_lic.ulf`
-  - macOS：`/Library/Application Support/Unity/Unity_lic.ulf`
-  - Linux：`~/.local/share/unity3d/Unity/Unity_lic.ulf`
-  新版 Unity Hub 可能不生成 `.ulf`，而是生成 `%LOCALAPPDATA%\Unity\licenses\UnityEntitlementLicense.xml`，把它的全部内容填进 `UNITY_LICENSE` 也可以（CI 会自动识别格式）。
-- 或者（Pro/Plus 序列号）：`UNITY_SERIAL`、`UNITY_EMAIL`、`UNITY_PASSWORD`
+### 2. 运行
+推送到 `main` 会自动构建；也可在 **Actions → Build iOS (unsigned IPA) → Run workflow** 手动运行。
+成功后在运行页面下载 `AliceInCradle-unsigned-ipa`，用 AltStore / SideStore / TrollStore / Sideloadly 等自行签名安装。
 
-### 2. 游戏文件（已就绪）
-
-默认使用 `game-archive` 分支中的压缩包，无需配置。
-如需换成别的版本，可设置可选 secret `GAME_ARCHIVE_URL`（直链或绿联 `ug.link` 分享链接），或在手动运行时填写 `game_url`。
-
-### 3. 运行
-
-推送到 `main` 会自动构建，也可以在 **Actions → Build iOS (unsigned IPA) → Run workflow** 手动运行（可临时填写 `game_url`）。
-成功后在运行页面下载 `AliceInCradle-unsigned-ipa` 产物，用 AltStore / SideStore / TrollStore / Sideloadly 等自行签名安装。
-
-可选仓库变量（Variables）：`IOS_BUNDLE_ID`（默认 `com.aliceincradle.iosport`）、`IOS_VERSION`（默认 `0.30.9`）。
+可选仓库变量（Settings → Variables）：
+- `UNITY_EXE`：若自动找不到 Unity，填 `Unity.exe` 的完整路径
+- `IOS_BUNDLE_ID`（默认 `com.aliceincradle.iosport`）、`IOS_VERSION`（默认 `0.30.9`）
 
 ## 流水线
 
 ```
-ubuntu-24.04 (job: unity)
-  读取 game-archive 分支并校验解压 → 编译替代 DLL 并校验引用 → 重建着色器(+glslang 校验)
-  → AssetRipper 导出工程 → Unity 解析包 → 合并/重映射 → Unity(docker) 构建 iOS AssetBundle 与 Xcode 工程
-macos-26 (job: ipa)
+你的 Windows 电脑 (job: unity, self-hosted)
+  读取 game-archive 分支并校验解压 → 编译替代 DLL 并校验引用 → 重建着色器
+  → AssetRipper 导出工程 → Unity 解析包 → 合并/重映射 → Unity 构建 iOS AssetBundle 与 Xcode 工程
+GitHub macos-26 (job: ipa)
   xcodebuild archive (CODE_SIGNING_ALLOWED=NO) → Payload/*.app → .ipa
 ```
 
@@ -62,7 +55,7 @@ macos-26 (job: ipa)
 - `managed/SFB` — 文件对话框替代实现
 - `tools/shaderport` — DXBC → HLSL/ShaderLab 转换器
 - `tools/PortTool` — 脚本引用重映射 / 引用校验
-- `tools/ci` — 下载、AssetRipper、合并、Unity docker 脚本
+- `tools/ci` — 压缩包重组、AssetRipper、项目合并、Unity 定位/运行脚本（PowerShell / Python）
 - `unity/` — iOS Unity 工程骨架（编辑器构建脚本、触屏控制、启动设置）
 
 ## 版权说明
