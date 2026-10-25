@@ -3,7 +3,7 @@
 把 AliceInCradle Windows 版（ver030，Unity 2022.3.62f2 / URP / Mono）移植到 iOS 的构建流水线。
 GitHub Actions 会下载游戏原始文件，重建 Unity 工程，以 **Metal + IL2CPP arm64** 生成 iOS 工程，再用 **Xcode 26（iOS 26 SDK）** 打出**未签名 IPA**。
 
-> 本仓库**不包含任何游戏文件**，也不提交反编译代码或转换后的着色器。所有游戏内容都在 CI 运行时从你提供的下载链接获取并现场转换。
+> 游戏原始压缩包（ver030i，588 MB）分片存放在本仓库的 **`game-archive` 分支**（`archive/*.7z.part00..05`，附 SHA256 校验），CI 直接从该分支读取、校验并解压，不再依赖外部下载服务。`main` 分支不提交反编译代码或转换后的着色器，这些都在 CI 中现场生成。
 
 ## 移植做了什么
 
@@ -32,12 +32,10 @@ Unity 编辑器在 CI 中运行需要许可证（个人版免费）。在仓库 
   - Linux：`~/.local/share/unity3d/Unity/Unity_lic.ulf`
 - 或者（Pro/Plus 序列号）：`UNITY_SERIAL`、`UNITY_EMAIL`、`UNITY_PASSWORD`
 
-### 2. 提供游戏下载链接（必需）
+### 2. 游戏文件（已就绪）
 
-- `GAME_ARCHIVE_URL`：Windows 版压缩包（.7z/.zip）的下载地址。
-  支持直链，也支持绿联 NAS 分享链接（`ug.link/.../share-download/?id=...`，CI 会用无头浏览器下载）。
-
-> ⚠️ 你最初提供的分享链接将于 **2026-10-26 09:31 UTC** 过期，请延长有效期或换一个长期链接。
+默认使用 `game-archive` 分支中的压缩包，无需配置。
+如需换成别的版本，可设置可选 secret `GAME_ARCHIVE_URL`（直链或绿联 `ug.link` 分享链接），或在手动运行时填写 `game_url`。
 
 ### 3. 运行
 
@@ -50,7 +48,7 @@ Unity 编辑器在 CI 中运行需要许可证（个人版免费）。在仓库 
 
 ```
 ubuntu-24.04 (job: unity)
-  下载并解压游戏 → 编译替代 DLL 并校验引用 → 重建着色器(+glslang 校验)
+  读取 game-archive 分支并校验解压 → 编译替代 DLL 并校验引用 → 重建着色器(+glslang 校验)
   → AssetRipper 导出工程 → Unity 解析包 → 合并/重映射 → Unity(docker) 构建 iOS AssetBundle 与 Xcode 工程
 macos-26 (job: ipa)
   xcodebuild archive (CODE_SIGNING_ALLOWED=NO) → Payload/*.app → .ipa
@@ -69,6 +67,6 @@ macos-26 (job: ipa)
 ## 版权说明
 
 AliceInCradle 版权归 NanameHacha（ななめはっちゃ）所有。本仓库只包含移植工具代码，仅供已合法获得游戏的个人在自己的设备上使用。
-本仓库目前是**公开**的：公开仓库的 Actions 产物（包含游戏内容的 IPA）可被任何已登录的 GitHub 用户下载。为避免再分发游戏内容，建议把仓库设为私有（注意私有仓库的 Actions 存储配额较小）。
+本仓库目前是**公开**的，`game-archive` 分支中的游戏压缩包以及 Actions 产物（IPA）都可被他人下载，相当于公开再分发游戏。建议把仓库设为私有（注意私有仓库的 Actions 存储配额与分钟数有限）。
 
 第三方代码见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

@@ -1,13 +1,14 @@
 name: Build iOS (unsigned IPA)
 
 # Ports the Windows build of AliceInCradle to iOS (Metal, IL2CPP arm64).
-# The game files are never stored in this repository: they are downloaded
-# from GAME_ARCHIVE_URL at build time.
+# The Windows build is read from the `game-archive` branch of this repository
+# (archive/*.7z.part*, reassembled and checksum-verified at build time).
 #
 # Required secrets:
-#   GAME_ARCHIVE_URL   direct link (or UGREEN share link) to the Windows .7z/.zip
 #   UNITY_LICENSE      contents of Unity_lic.ulf            -- or --
 #   UNITY_SERIAL, UNITY_EMAIL, UNITY_PASSWORD (serial based activation)
+# Optional secret:
+#   GAME_ARCHIVE_URL   download the game from this URL instead of the game-archive branch
 # Optional repository variables:
 #   IOS_BUNDLE_ID      application identifier (default com.aliceincradle.iosport)
 #   IOS_VERSION        CFBundleShortVersionString (default 0.30.9)
@@ -16,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       game_url:
-        description: "Game archive URL (overrides the GAME_ARCHIVE_URL secret)"
+        description: "Game archive URL (optional; default: game-archive branch)"
         required: false
         default: ""
   push:
@@ -48,10 +49,6 @@ jobs:
       - name: Check configuration
         run: |
           ok=1
-          if [ -z "$GAME_URL" ]; then
-            echo "::error::Set the GAME_ARCHIVE_URL secret (or pass game_url) to a download link of the Windows build."
-            ok=0
-          fi
           if [ -z "$UNITY_LICENSE" ] && [ -z "$UNITY_SERIAL" ]; then
             echo "::error::Set UNITY_LICENSE (Unity_lic.ulf contents) or UNITY_SERIAL/UNITY_EMAIL/UNITY_PASSWORD secrets."
             ok=0
@@ -87,9 +84,24 @@ jobs:
       - name: Pull Unity editor image
         run: docker pull -q "$UNITY_IMAGE"
 
-      - name: Download game
+      - name: Fetch game archive branch
+        if: env.GAME_URL == ''
+        uses: actions/checkout@v4
+        with:
+          ref: game-archive
+          path: game-archive
+
+      - name: Unpack game
         run: |
-          GAME_ROOT=$(tools/ci/download_game.sh "$GAME_URL" "$WORK/dl")
+          if [ -n "$GAME_URL" ]; then
+            SRC="$GAME_URL"
+          else
+            cat game-archive/archive/*.7z.part* > "$WORK/game.7z"
+            (cd game-archive/archive && head -1 SHA256SUMS | sed "s#  .*#  $WORK/game.7z#") | sha256sum -c -
+            rm -rf game-archive
+            SRC="$WORK/game.7z"
+          fi
+          GAME_ROOT=$(tools/ci/download_game.sh "$SRC" "$WORK/dl")
           GAME_DATA=$(ls -d "$GAME_ROOT"/*_Data | head -1)
           echo "GAME_ROOT=$GAME_ROOT" >> "$GITHUB_ENV"
           echo "GAME_DATA=$GAME_DATA" >> "$GITHUB_ENV"
