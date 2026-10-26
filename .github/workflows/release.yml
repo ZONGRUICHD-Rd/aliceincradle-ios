@@ -1,0 +1,70 @@
+name: Release IPA
+
+# Publishes the unsigned IPA of a finished "Build iOS (unsigned IPA)" run as a
+# GitHub release (no rebuild). Run it from Actions -> Release IPA -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Build run ID (empty = latest successful build on main)"
+        required: false
+      tag:
+        description: "Release tag (empty = v<version>-build<run number>)"
+        required: false
+      prerelease:
+        description: "Mark as pre-release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.run_id }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID=$(gh run list -R "$REPO" --workflow build-ios.yml --branch main --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          fi
+          [ -n "$RUN_ID" ] || { echo "no successful build run found"; exit 1; }
+          number=$(gh run view "$RUN_ID" -R "$REPO" --json number -q .number)
+          sha=$(gh run view "$RUN_ID" -R "$REPO" --json headSha -q .headSha)
+          echo "build run $RUN_ID (#$number) at $sha"
+
+          gh run download "$RUN_ID" -R "$REPO" -n AliceInCradle-unsigned-ipa -D dist
+          ipa=$(ls dist/*.ipa | head -1)
+          ver=$(basename "$ipa" | sed -E 's/^AliceInCradle-(.*)-unsigned\.ipa$/\1/')
+          [ -n "$TAG" ] || TAG="v${ver}-build${number}"
+          (cd dist && sha256sum *.ipa > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+          cat > notes.md <<EOF
+          AliceInCradle ver${ver} 的 iOS 移植版（Metal / IL2CPP arm64），**未签名**。
+          构建：[Actions 运行 #${number}](https://github.com/${REPO}/actions/runs/${RUN_ID})，提交 \`${sha:0:7}\`。
+
+          ### 安装
+          下载 \`$(basename "$ipa")\`，用 AltStore / SideStore / Sideloadly 以自己的 Apple ID 签名安装，或用 TrollStore 直接安装。最低 iOS 15，面向 iOS 26（Xcode 26 SDK）。
+
+          ### 说明
+          - 尚未在真机上完整测试，遇到闪退或异常请反馈。
+          - 安装后约 2.3 GB（纹理未压缩，保留像素画质）。
+          - 触屏虚拟手柄；连接 MFi / Xbox / PS 手柄时自动隐藏。
+
+          AliceInCradle 版权归 NanameHacha（ななめはっちゃ）所有，本移植仅供已合法获得游戏的玩家个人使用。
+          EOF
+
+          flags=()
+          [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+          gh release create "$TAG" "$ipa" dist/SHA256SUMS.txt -R "$REPO" --target "$sha" \
+            --title "AliceInCradle iOS ${ver} (build ${number})" --notes-file notes.md "${flags[@]}"
+          gh release view "$TAG" -R "$REPO" --json url -q .url
