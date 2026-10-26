@@ -468,6 +468,22 @@ namespace IOSPort.EditorTools
                     if (m.type == LogType.Error || m.type == LogType.Exception)
                         Debug.LogError("[IOSPort] " + step.name + ": " + m.content);
             if (report.summary.result != BuildResult.Succeeded) throw new Exception("player build failed");
+            EnableFileSharing(Path.Combine(output, "Info.plist"));
+        }
+
+        /// <summary>Show the app's Documents folder (saves, iosport-log.txt) in the Files app.</summary>
+        static void EnableFileSharing(string plist)
+        {
+            if (!File.Exists(plist)) throw new Exception("Info.plist not found: " + plist);
+            string text = File.ReadAllText(plist);
+            var add = new StringBuilder();
+            foreach (var key in new[] { "UIFileSharingEnabled", "LSSupportsOpeningDocumentsInPlace" })
+                if (!text.Contains("<key>" + key + "</key>"))
+                    add.Append("\t<key>").Append(key).Append("</key>\n\t<true/>\n");
+            int end = text.LastIndexOf("</dict>", StringComparison.Ordinal);
+            if (end < 0) throw new Exception("unexpected Info.plist format");
+            File.WriteAllText(plist, text.Insert(end, add.ToString()));
+            Log("Info.plist: file sharing enabled");
         }
     }
 }
