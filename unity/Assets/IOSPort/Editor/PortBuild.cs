@@ -452,6 +452,7 @@ namespace IOSPort.EditorTools
                     .Select(AssetDatabase.GUIDToAssetPath).OrderBy(p => p).ToArray();
             }
             Log("scenes: " + string.Join(", ", scenes));
+            CheckMissingScripts(scenes);
             if (Directory.Exists(output)) Directory.Delete(output, true);
             var opts = new BuildPlayerOptions
             {
@@ -469,6 +470,40 @@ namespace IOSPort.EditorTools
                         Debug.LogError("[IOSPort] " + step.name + ": " + m.content);
             if (report.summary.result != BuildResult.Succeeded) throw new Exception("player build failed");
             EnableFileSharing(Path.Combine(output, "Info.plist"));
+        }
+
+        /// <summary>
+        /// A component whose script the editor cannot resolve is written without
+        /// its fields, and the player then reads past the end of the data
+        /// (fatal while loading the scene). Fail early instead.
+        /// </summary>
+        static void CheckMissingScripts(string[] scenes)
+        {
+            int sceneMissing = 0;
+            foreach (var path in scenes)
+            {
+                var scene = UnityEditor.SceneManagement.EditorSceneManager.OpenScene(path, UnityEditor.SceneManagement.OpenSceneMode.Single);
+                int n = 0;
+                foreach (var root in scene.GetRootGameObjects())
+                    foreach (var t in root.GetComponentsInChildren<Transform>(true))
+                    {
+                        int c = GameObjectUtility.GetMonoBehavioursWithMissingScriptCount(t.gameObject);
+                        if (c > 0) { n += c; Debug.LogError($"[IOSPort] missing script on '{t.name}' in {path}"); }
+                    }
+                Log($"scene {path}: {n} missing scripts");
+                sceneMissing += n;
+            }
+            int prefabMissing = 0, prefabs = 0;
+            foreach (var guid in AssetDatabase.FindAssets("t:Prefab", new[] { "Assets" }))
+            {
+                var go = AssetDatabase.LoadAssetAtPath<GameObject>(AssetDatabase.GUIDToAssetPath(guid));
+                if (go == null) continue;
+                prefabs++;
+                foreach (var t in go.GetComponentsInChildren<Transform>(true))
+                    prefabMissing += GameObjectUtility.GetMonoBehavioursWithMissingScriptCount(t.gameObject);
+            }
+            Log($"{prefabs} prefabs: {prefabMissing} missing scripts");
+            if (sceneMissing > 0) throw new Exception($"{sceneMissing} missing scripts in scenes (see log)");
         }
 
         /// <summary>Show the app's Documents folder (saves, iosport-log.txt) in the Files app.</summary>

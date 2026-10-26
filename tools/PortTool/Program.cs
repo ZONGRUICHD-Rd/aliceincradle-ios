@@ -16,6 +16,10 @@ namespace PortTool;
 ///       (Assets/Plugins/X.dll) so they point to the package sources instead.
 ///   check-refs     &lt;dir&gt; &lt;targetAssembly&gt; &lt;asm&gt;...
 ///       Verifies every member reference into targetAssembly resolves.
+///   rename-assembly &lt;dll&gt; &lt;newName&gt; [searchDir...]
+///       Renames a plugin assembly (file, assembly and module name), keeps its
+///       .meta (GUID) and updates references from the other DLLs next to it.
+///       searchDirs help resolve referenced assemblies (e.g. the game's Managed).
 ///   fix-generic-comparers &lt;dll&gt;
 ///       Rewrites IEqualityComparer&lt;T&gt; methods that compare an unconstrained T
 ///       with raw IL (ldarg; ldarg; ceq), which IL2CPP rejects, to call
@@ -42,6 +46,7 @@ static class Program
             case "remap-scripts": return RemapScripts(args[1], args[2], args.Skip(3).ToArray());
             case "check-refs": return CheckRefs(args[1], args[2], args.Skip(3).ToArray());
             case "fix-generic-comparers": return FixGenericComparers(args[1]);
+            case "rename-assembly": return RenameAssembly(args[1], args[2], args.Skip(3).ToArray());
             default:
                 Console.Error.WriteLine("unknown command " + args[0]);
                 return 2;
@@ -312,6 +317,42 @@ static class Program
         }
         if (fixedCount > 0) module.Write(dll);
         Console.WriteLine($"{Path.GetFileName(dll)}: {fixedCount} methods rewritten");
+        return 0;
+    }
+
+    // Unity reserves "Assembly-CSharp" for its own compiled scripts: a
+    // precompiled plugin with that name is shadowed in the editor, its
+    // MonoBehaviours are written as missing scripts (no fields) and the player
+    // then reads past their data while loading the first scene.
+    static int RenameAssembly(string dll, string newName, string[] searchDirs)
+    {
+        string dir = Path.GetDirectoryName(Path.GetFullPath(dll));
+        string target = Path.Combine(dir, newName + ".dll");
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(dir);
+        foreach (var d in searchDirs) resolver.AddSearchDirectory(d);
+        var rp = new ReaderParameters { AssemblyResolver = resolver };
+        var module = ModuleDefinition.ReadModule(new MemoryStream(File.ReadAllBytes(dll)), rp);
+        string oldName = module.Assembly.Name.Name;
+        module.Assembly.Name.Name = newName;
+        module.Name = newName + ".dll";
+        module.Write(target);
+        if (File.Exists(dll + ".meta")) File.Move(dll + ".meta", target + ".meta", true);
+        if (!string.Equals(Path.GetFullPath(dll), target, StringComparison.OrdinalIgnoreCase)) File.Delete(dll);
+        Console.WriteLine($"renamed {oldName} -> {newName}");
+
+        foreach (var other in Directory.GetFiles(dir, "*.dll"))
+        {
+            if (string.Equals(other, target, StringComparison.OrdinalIgnoreCase)) continue;
+            ModuleDefinition m;
+            try { m = ModuleDefinition.ReadModule(new MemoryStream(File.ReadAllBytes(other)), rp); }
+            catch { continue; }
+            var refs = m.AssemblyReferences.Where(r => r.Name == oldName).ToList();
+            if (refs.Count == 0) continue;
+            foreach (var r in refs) r.Name = newName;
+            m.Write(other);
+            Console.WriteLine($"  updated reference in {Path.GetFileName(other)}");
+        }
         return 0;
     }
 }
