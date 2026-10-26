@@ -78,6 +78,7 @@ namespace IOSPort.EditorTools
             WriteLinkXml();
             FixDummyShaders(Arg("-portShaderMap"));
             CheckRenderPipeline();
+            IncludeBuiltinShaders();
             RelinkRendererFeatures();
             BuildBundles(Arg("-portManifests"));
             ConfigurePlayer();
@@ -215,6 +216,32 @@ namespace IOSPort.EditorTools
                 var q = QualitySettings.GetRenderPipelineAssetAt(i);
                 if (q != null) Log($"quality level {i} ({QualitySettings.names[i]}) pipeline: {AssetDatabase.GetAssetPath(q)}");
             }
+        }
+
+        // UI created at runtime (the touch controls) uses the built-in UI/Default
+        // shader, which nothing in the game's scenes references, so the build
+        // strips it and the controls render with the error shader (magenta).
+        static void IncludeBuiltinShaders()
+        {
+            var gs = AssetDatabase.LoadAssetAtPath<GraphicsSettings>("ProjectSettings/GraphicsSettings.asset");
+            var so = new SerializedObject(gs);
+            var list = so.FindProperty("m_AlwaysIncludedShaders");
+            var shaders = new List<Shader>();
+            var ui = Canvas.GetDefaultCanvasMaterial();
+            if (ui != null && ui.shader != null) shaders.Add(ui.shader);
+            else Debug.LogWarning("[IOSPort] default canvas material not found");
+            foreach (var s in shaders)
+            {
+                bool present = false;
+                for (int i = 0; i < list.arraySize; i++)
+                    if (list.GetArrayElementAtIndex(i).objectReferenceValue == s) { present = true; break; }
+                if (present) continue;
+                list.InsertArrayElementAtIndex(list.arraySize);
+                list.GetArrayElementAtIndex(list.arraySize - 1).objectReferenceValue = s;
+                Log($"always included shader: {s.name} ({AssetDatabase.GetAssetPath(s)})");
+            }
+            so.ApplyModifiedPropertiesWithoutUndo();
+            AssetDatabase.SaveAssets();
         }
 
         // URP validates renderer features while importing, which can run before
@@ -512,13 +539,13 @@ namespace IOSPort.EditorTools
             if (!File.Exists(plist)) throw new Exception("Info.plist not found: " + plist);
             string text = File.ReadAllText(plist);
             var add = new StringBuilder();
-            foreach (var key in new[] { "UIFileSharingEnabled", "LSSupportsOpeningDocumentsInPlace" })
+            foreach (var key in new[] { "UIFileSharingEnabled", "LSSupportsOpeningDocumentsInPlace", "LSSupportsGameMode" })
                 if (!text.Contains("<key>" + key + "</key>"))
                     add.Append("\t<key>").Append(key).Append("</key>\n\t<true/>\n");
             int end = text.LastIndexOf("</dict>", StringComparison.Ordinal);
             if (end < 0) throw new Exception("unexpected Info.plist format");
             File.WriteAllText(plist, text.Insert(end, add.ToString()));
-            Log("Info.plist: file sharing enabled");
+            Log("Info.plist: file sharing and Game Mode enabled");
         }
     }
 }
