@@ -20,6 +20,14 @@ namespace PortTool;
 ///       Renames a plugin assembly (file, assembly and module name), keeps its
 ///       .meta (GUID) and updates references from the other DLLs next to it.
 ///       searchDirs help resolve referenced assemblies (e.g. the game's Managed).
+///   skip-environment-check &lt;unsafeAssem.dll&gt; [searchDir...]
+///       XX.IN.Awake only lets the game start on the genuine Windows player: it
+///       hashes Process.MainModule (the .exe) and requires its version to be the
+///       Unity release the game shipped with, then rejects Android emulators.
+///       None of that exists on iOS, so branch over the whole block.
+///   redirect-io &lt;IOSPort.Compat.dll&gt; &lt;dll&gt;... [--search dir]...
+///       Points the game's file calls (File.Exists, FileStream, AssetBundle.LoadFromFile...)
+///       at IOSPort.Compat.GameIO, which resolves paths case-insensitively.
 ///   fix-generic-comparers &lt;dll&gt;
 ///       Rewrites IEqualityComparer&lt;T&gt; methods that compare an unconstrained T
 ///       with raw IL (ldarg; ldarg; ceq), which IL2CPP rejects, to call
@@ -47,6 +55,8 @@ static class Program
             case "check-refs": return CheckRefs(args[1], args[2], args.Skip(3).ToArray());
             case "fix-generic-comparers": return FixGenericComparers(args[1]);
             case "rename-assembly": return RenameAssembly(args[1], args[2], args.Skip(3).ToArray());
+            case "skip-environment-check": return SkipEnvironmentCheck(args[1], args.Skip(2).ToArray());
+            case "redirect-io": return RedirectIo(args[1], args.Skip(2).ToArray());
             default:
                 Console.Error.WriteLine("unknown command " + args[0]);
                 return 2;
@@ -254,6 +264,25 @@ static class Program
         return bad == 0 ? 0 : 1;
     }
 
+    /// <summary>The parameter an ldarg instruction loads, or null for "this".</summary>
+    static ParameterDefinition LoadedParameter(MethodDefinition m, Mono.Cecil.Cil.Instruction ins)
+    {
+        int index;
+        switch (ins.OpCode.Code)
+        {
+            case Mono.Cecil.Cil.Code.Ldarg_0: index = 0; break;
+            case Mono.Cecil.Cil.Code.Ldarg_1: index = 1; break;
+            case Mono.Cecil.Cil.Code.Ldarg_2: index = 2; break;
+            case Mono.Cecil.Cil.Code.Ldarg_3: index = 3; break;
+            case Mono.Cecil.Cil.Code.Ldarg_S:
+            case Mono.Cecil.Cil.Code.Ldarg:
+                return ins.Operand as ParameterDefinition;
+            default: return null;
+        }
+        if (!m.IsStatic) index--; // argument 0 is "this"
+        return index >= 0 && index < m.Parameters.Count ? m.Parameters[index] : null;
+    }
+
     static bool UsesRawGenericValue(MethodDefinition m, GenericParameter t)
     {
         // a parameter of type T loaded onto the stack and used directly by
@@ -262,12 +291,13 @@ static class Program
         var ins = m.Body.Instructions;
         for (int i = 0; i + 1 < ins.Count; i++)
         {
-            var op = ins[i].OpCode.Code;
-            if (op != Mono.Cecil.Cil.Code.Ldarg_1 && op != Mono.Cecil.Cil.Code.Ldarg_2) continue;
-            var next = ins[i + 1].OpCode.Code;
-            if (next == Mono.Cecil.Cil.Code.Ceq || ins[i + 1].OpCode.Name.StartsWith("conv.")
-                || (next == Mono.Cecil.Cil.Code.Ldarg_2 && i + 2 < ins.Count && ins[i + 2].OpCode.Code == Mono.Cecil.Cil.Code.Ceq))
-                return m.Parameters.Any(p => p.ParameterType == t);
+            var p = LoadedParameter(m, ins[i]);
+            if (p == null || p.ParameterType != t) continue;
+            var next = ins[i + 1];
+            if (next.OpCode.Code == Mono.Cecil.Cil.Code.Ceq || next.OpCode.Name.StartsWith("conv.")) return true;
+            var p2 = LoadedParameter(m, next);
+            if (p2 != null && p2.ParameterType == t && i + 2 < ins.Count && ins[i + 2].OpCode.Code == Mono.Cecil.Cil.Code.Ceq)
+                return true;
         }
         return false;
     }
@@ -306,8 +336,9 @@ static class Program
                 body.ExceptionHandlers.Clear();
                 var il = body.GetILProcessor();
                 il.Emit(Mono.Cecil.Cil.OpCodes.Call, getDefault);
-                il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_1);
-                if (isEquals) il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg_2);
+                // by parameter, so static and instance methods both load the right arguments
+                il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, m.Parameters[0]);
+                if (isEquals) il.Emit(Mono.Cecil.Cil.OpCodes.Ldarg, m.Parameters[1]);
                 il.Emit(Mono.Cecil.Cil.OpCodes.Callvirt, call);
                 il.Emit(Mono.Cecil.Cil.OpCodes.Ret);
                 body.MaxStackSize = 3;
@@ -354,5 +385,151 @@ static class Program
             Console.WriteLine($"  updated reference in {Path.GetFileName(other)}");
         }
         return 0;
+    }
+
+    static ReaderParameters ResolvingReader(string dll, string[] searchDirs)
+    {
+        var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(Path.GetDirectoryName(Path.GetFullPath(dll)));
+        foreach (var d in searchDirs) resolver.AddSearchDirectory(d);
+        return new ReaderParameters { AssemblyResolver = resolver };
+    }
+
+    static int SkipEnvironmentCheck(string dll, string[] searchDirs)
+    {
+        const string invalidScene = "SceneCannotLaunch_InvalidEnviroment";
+        var module = ModuleDefinition.ReadModule(new MemoryStream(File.ReadAllBytes(dll)), ResolvingReader(dll, searchDirs));
+        var awake = module.GetType("XX.IN")?.Methods.FirstOrDefault(m => m.Name == "Awake" && m.HasBody);
+        if (awake == null)
+        {
+            Console.WriteLine("XX.IN.Awake not found, nothing to patch");
+            return 0;
+        }
+        var ins = awake.Body.Instructions;
+        int scene = -1;
+        for (int i = 0; i < ins.Count; i++)
+            if (ins[i].OpCode == Mono.Cecil.Cil.OpCodes.Ldstr && (string)ins[i].Operand == invalidScene) { scene = i; break; }
+        if (scene < 0)
+        {
+            Console.WriteLine("no environment check in XX.IN.Awake, nothing to patch");
+            return 0;
+        }
+        int start = -1;
+        for (int i = 0; i < scene; i++)
+            if (ins[i].OpCode == Mono.Cecil.Cil.OpCodes.Call && ins[i].Operand is MethodReference mr &&
+                mr.DeclaringType.FullName == "System.Diagnostics.Process" && mr.Name == "GetCurrentProcess") { start = i; break; }
+        if (start < 0)
+        {
+            // the check exists but is no longer built the way this patch expects
+            Console.Error.WriteLine("environment check: Process.GetCurrentProcess() not found before the scene switch");
+            return 1;
+        }
+        if (start > 0 && ins[start - 1].OpCode == Mono.Cecil.Cil.OpCodes.Br)
+        {
+            Console.WriteLine("environment check already skipped");
+            return 0;
+        }
+        int ret = -1;
+        for (int i = scene + 1; i < ins.Count; i++)
+            if (ins[i].OpCode == Mono.Cecil.Cil.OpCodes.Ret) { ret = i; break; }
+        if (ret < 0 || ret + 1 >= ins.Count)
+        {
+            Console.Error.WriteLine("environment check: unexpected code after the scene switch");
+            return 1;
+        }
+        var target = ins[ret + 1];
+        // the branch must not enter or leave a protected region
+        foreach (var h in awake.Body.ExceptionHandlers)
+        {
+            int ts = ins.IndexOf(h.TryStart), he = h.HandlerEnd == null ? ins.Count : ins.IndexOf(h.HandlerEnd);
+            bool startInside = start >= ts && start < he;
+            bool targetInside = ret + 1 >= ts && ret + 1 < he;
+            if (startInside || targetInside)
+            {
+                Console.Error.WriteLine("environment check: block overlaps an exception handler, refusing to patch");
+                return 1;
+            }
+        }
+        var il = awake.Body.GetILProcessor();
+        var br = il.Create(Mono.Cecil.Cil.OpCodes.Br, target);
+        var first = ins[start];
+        il.InsertBefore(first, br);
+        foreach (var i in ins)
+            if (i != br && i.Operand == first) i.Operand = br;
+        module.Write(dll);
+        Console.WriteLine($"environment check skipped in {awake.FullName} ({ret - start + 1} instructions bypassed)");
+        return 0;
+    }
+
+    // original call (declaring type::name(parameter types)) -> IOSPort.Compat.GameIO method
+    static readonly Dictionary<string, string> IoRedirects = new()
+    {
+        ["System.IO.File::Exists(System.String)"] = "File_Exists",
+        ["System.IO.Directory::Exists(System.String)"] = "Directory_Exists",
+        ["System.IO.File::OpenRead(System.String)"] = "File_OpenRead",
+        ["System.IO.File::GetAttributes(System.String)"] = "File_GetAttributes",
+        ["System.IO.Directory::GetFiles(System.String,System.String)"] = "Directory_GetFiles",
+        ["System.IO.Directory::GetFiles(System.String,System.String,System.IO.SearchOption)"] = "Directory_GetFiles",
+        ["System.IO.FileStream::.ctor(System.String,System.IO.FileMode,System.IO.FileAccess,System.IO.FileShare)"] = "FileStream_ctor",
+        ["System.IO.StreamReader::.ctor(System.String)"] = "StreamReader_ctor",
+        ["System.IO.FileInfo::.ctor(System.String)"] = "FileInfo_ctor",
+        ["UnityEngine.AssetBundle::LoadFromFile(System.String)"] = "AssetBundle_LoadFromFile",
+        ["UnityEngine.AssetBundle::LoadFromFileAsync(System.String)"] = "AssetBundle_LoadFromFileAsync",
+    };
+
+    static string CallKey(MethodReference mr) =>
+        $"{mr.DeclaringType.FullName}::{mr.Name}({string.Join(",", mr.Parameters.Select(p => p.ParameterType.FullName))})";
+
+    static int RedirectIo(string compatDll, string[] rest)
+    {
+        var dlls = new List<string>();
+        var searchDirs = new List<string>();
+        for (int i = 0; i < rest.Length; i++)
+        {
+            if (rest[i] == "--search" && i + 1 < rest.Length) searchDirs.Add(rest[++i]);
+            else dlls.Add(rest[i]);
+        }
+        var compat = ModuleDefinition.ReadModule(compatDll);
+        var gameIo = compat.GetType("IOSPort.Compat.GameIO") ?? throw new Exception("IOSPort.Compat.GameIO not found");
+        // every redirect target must exist with the original's parameters
+        var targets = new Dictionary<string, MethodDefinition>();
+        foreach (var kv in IoRedirects)
+        {
+            string paramList = kv.Key.Substring(kv.Key.IndexOf('(') + 1).TrimEnd(')');
+            var md = gameIo.Methods.FirstOrDefault(m => m.Name == kv.Value && m.IsStatic &&
+                string.Join(",", m.Parameters.Select(p => p.ParameterType.FullName)) == paramList);
+            targets[kv.Key] = md ?? throw new Exception($"GameIO.{kv.Value}({paramList}) missing");
+        }
+
+        int failed = 0;
+        foreach (var dll in dlls)
+        {
+            var rp = ResolvingReader(dll, searchDirs.Append(Path.GetDirectoryName(Path.GetFullPath(compatDll))).ToArray());
+            var module = ModuleDefinition.ReadModule(new MemoryStream(File.ReadAllBytes(dll)), rp);
+            var counts = new SortedDictionary<string, int>();
+            foreach (var t in AllTypes(module))
+                foreach (var m in t.Methods)
+                {
+                    if (!m.HasBody) continue;
+                    foreach (var ins in m.Body.Instructions)
+                    {
+                        if (ins.OpCode != Mono.Cecil.Cil.OpCodes.Call && ins.OpCode != Mono.Cecil.Cil.OpCodes.Newobj) continue;
+                        if (ins.Operand is not MethodReference mr || !targets.TryGetValue(CallKey(mr), out var target)) continue;
+                        // newobj X::.ctor(args) and call GameIO.X_ctor(args) leave the same stack
+                        ins.OpCode = Mono.Cecil.Cil.OpCodes.Call;
+                        ins.Operand = module.ImportReference(target);
+                        counts[target.Name] = counts.GetValueOrDefault(target.Name) + 1;
+                    }
+                }
+            int total = counts.Values.Sum();
+            if (total > 0)
+            {
+                try { module.Write(dll); }
+                catch (Exception e) { Console.Error.WriteLine($"{Path.GetFileName(dll)}: write failed: {e.Message}"); failed++; continue; }
+            }
+            Console.WriteLine($"{Path.GetFileName(dll)}: {total} file calls redirected" +
+                (total > 0 ? " (" + string.Join(", ", counts.Select(c => $"{c.Key} {c.Value}")) + ")" : ""));
+        }
+        return failed == 0 ? 0 : 1;
     }
 }

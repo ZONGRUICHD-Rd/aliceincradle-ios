@@ -132,6 +132,10 @@ namespace IOSPort.EditorTools
                 Log("no shader map, skipping dummy shader replacement");
                 return;
             }
+            // The exported placeholders carry the same names as the real URP and
+            // built-in shaders, so Shader.Find may return either. Only look at
+            // shaders that ship with the packages or the editor.
+            var realShaders = RealShaders();
             var dummies = new Dictionary<Shader, Shader>();
             var dummyPaths = new List<string>();
             foreach (var line in File.ReadAllLines(mapFile))
@@ -139,9 +143,8 @@ namespace IOSPort.EditorTools
                 var parts = line.Split('\t');
                 if (parts.Length < 2) continue;
                 var dummy = AssetDatabase.LoadAssetAtPath<Shader>(parts[0]);
-                var real = Shader.Find(parts[1]);
                 if (dummy == null) continue;
-                if (real == null || real == dummy)
+                if (!realShaders.TryGetValue(parts[1], out var real))
                 {
                     Log($"no real shader for '{parts[1]}' ({parts[0]}), keeping placeholder");
                     continue;
@@ -181,8 +184,41 @@ namespace IOSPort.EditorTools
             foreach (var obj in gs)
                 if (obj != null && ReplaceReferences(obj, dummies)) changed++;
             AssetDatabase.SaveAssets();
+            // scenes: components can reference shaders directly
+            foreach (var scenePath in AssetDatabase.FindAssets("t:Scene", new[] { "Assets" }).Select(AssetDatabase.GUIDToAssetPath))
+            {
+                var scene = UnityEditor.SceneManagement.EditorSceneManager.OpenScene(scenePath, UnityEditor.SceneManagement.OpenSceneMode.Single);
+                int sceneChanged = 0;
+                foreach (var root in scene.GetRootGameObjects())
+                    foreach (var c in root.GetComponentsInChildren<Component>(true))
+                        if (c != null && ReplaceReferences(c, dummies)) sceneChanged++;
+                if (sceneChanged > 0)
+                {
+                    UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(scene);
+                    UnityEditor.SceneManagement.EditorSceneManager.SaveScene(scene);
+                    changed += sceneChanged;
+                }
+            }
             foreach (var p in dummyPaths) AssetDatabase.DeleteAsset(p);
             Log($"replaced placeholder shader references in {changed} objects");
+        }
+
+        /// <summary>Shaders from the packages and the editor's built-in resources, by name.</summary>
+        static Dictionary<string, Shader> RealShaders()
+        {
+            var map = new Dictionary<string, Shader>(StringComparer.Ordinal);
+            foreach (var guid in AssetDatabase.FindAssets("t:Shader"))
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                if (!path.StartsWith("Packages/")) continue;
+                var s = AssetDatabase.LoadAssetAtPath<Shader>(path);
+                if (s != null && !map.ContainsKey(s.name)) map.Add(s.name, s);
+            }
+            foreach (var res in new[] { "Resources/unity_builtin_extra", "Library/unity default resources" })
+                foreach (var o in AssetDatabase.LoadAllAssetsAtPath(res))
+                    if (o is Shader s && !map.ContainsKey(s.name)) map.Add(s.name, s);
+            Log($"{map.Count} package/built-in shaders available as replacements");
+            return map;
         }
 
         static bool ReplaceReferences(UnityEngine.Object obj, Dictionary<Shader, Shader> map)
@@ -333,14 +369,16 @@ namespace IOSPort.EditorTools
                 if (imp != null && !string.IsNullOrEmpty(imp.assetBundleName)) imp.assetBundleName = null;
             }
 
-            var bundles = new List<(string rel, string name)>();
-            var builds = new List<AssetBundleBuild>();
-            // Some bundles ship more than once under different paths (e.g. the
-            // Korean font in localization/ko-kr and localization/__AdditionalFonts).
-            // Unity allows an asset in one bundle only: build each asset set once
-            // and copy the result to every path.
-            var bySet = new Dictionary<string, string>();
-            var owner = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            // (manifest path, bundle name, build pass)
+            var bundles = new List<(string rel, string name, int pass)>();
+            // Unity allows an asset in only one bundle per build. Some bundles ship
+            // more than once under different paths (the Korean font is in both
+            // localization/ko-kr and localization/__AdditionalFonts): an identical
+            // asset set is built once and copied to every path. Bundles that only
+            // partly overlap go to another build pass, so each still gets all of
+            // its own assets.
+            var passes = new List<(Dictionary<string, string> owner, List<AssetBundleBuild> builds)>();
+            var bySet = new Dictionary<string, (string name, int pass)>();
             int missing = 0, shared = 0;
             foreach (var manifest in Directory.GetFiles(manifestDir, "*.manifest", SearchOption.AllDirectories))
             {
@@ -374,47 +412,43 @@ namespace IOSPort.EditorTools
                 }
                 assets = assets.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
                 string setKey = string.Join("\n", assets.Select(a => a.ToLowerInvariant()).OrderBy(a => a, StringComparer.Ordinal));
-                if (bySet.TryGetValue(setKey, out string existing))
+                if (bySet.TryGetValue(setKey, out var existing))
                 {
-                    bundles.Add((rel, existing));
+                    bundles.Add((rel, existing.name, existing.pass));
                     shared++;
                     continue;
                 }
                 string bundleName = rel.ToLowerInvariant();
-                // an asset already owned by another bundle stays there; this one depends on it
-                var own = new List<string>();
-                foreach (var a in assets)
+                int pass = passes.FindIndex(p => assets.All(a => !p.owner.ContainsKey(a)));
+                if (pass < 0)
                 {
-                    if (owner.TryGetValue(a, out string other))
-                        Debug.LogWarning($"[IOSPort] bundle {rel}: {a} already in {other}, left out");
-                    else
-                    {
-                        owner[a] = bundleName;
-                        own.Add(a);
-                    }
+                    passes.Add((new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), new List<AssetBundleBuild>()));
+                    pass = passes.Count - 1;
+                    if (pass > 0) Log($"bundle {rel} overlaps earlier bundles, built in pass {pass + 1}");
                 }
-                if (own.Count == 0) continue;
-                bySet[setKey] = bundleName;
-                builds.Add(new AssetBundleBuild { assetBundleName = bundleName, assetNames = own.ToArray() });
-                bundles.Add((rel, bundleName));
+                foreach (var a in assets) passes[pass].owner[a] = bundleName;
+                passes[pass].builds.Add(new AssetBundleBuild { assetBundleName = bundleName, assetNames = assets.ToArray() });
+                bySet[setKey] = (bundleName, pass);
+                bundles.Add((rel, bundleName, pass));
             }
-            Log($"building {builds.Count} asset bundles for {bundles.Count} files ({shared} duplicates, {missing} manifest entries not found)");
-            string outDir = "Temp/IOSBundles";
-            if (Directory.Exists(outDir)) Directory.Delete(outDir, true);
-            Directory.CreateDirectory(outDir);
-            var result = BuildPipeline.BuildAssetBundles(outDir, builds.ToArray(),
-                BuildAssetBundleOptions.ChunkBasedCompression | BuildAssetBundleOptions.DeterministicAssetBundle,
-                BuildTarget.iOS);
-            if (result == null) throw new Exception("BuildAssetBundles failed");
-            int copied = 0;
-            foreach (var (rel, name) in bundles)
+            Log($"building {passes.Sum(p => p.builds.Count)} asset bundles in {passes.Count} pass(es) for {bundles.Count} files " +
+                $"({shared} duplicates, {missing} manifest entries not found)");
+            const string outRoot = "Temp/IOSBundles";
+            if (Directory.Exists(outRoot)) Directory.Delete(outRoot, true);
+            for (int i = 0; i < passes.Count; i++)
             {
-                string src = Path.Combine(outDir, name);
-                if (!File.Exists(src))
-                {
-                    Debug.LogWarning("[IOSPort] bundle output missing: " + name);
-                    continue;
-                }
+                string outDir = Path.Combine(outRoot, "pass" + i);
+                Directory.CreateDirectory(outDir);
+                var result = BuildPipeline.BuildAssetBundles(outDir, passes[i].builds.ToArray(),
+                    BuildAssetBundleOptions.ChunkBasedCompression | BuildAssetBundleOptions.DeterministicAssetBundle,
+                    BuildTarget.iOS);
+                if (result == null) throw new Exception($"BuildAssetBundles failed (pass {i + 1})");
+            }
+            int copied = 0;
+            foreach (var (rel, name, pass) in bundles)
+            {
+                string src = Path.Combine(outRoot, "pass" + pass, name);
+                if (!File.Exists(src)) throw new Exception("bundle output missing: " + name);
                 string dst = Path.Combine("Assets/StreamingAssets", rel);
                 Directory.CreateDirectory(Path.GetDirectoryName(dst));
                 File.Copy(src, dst, true);

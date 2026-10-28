@@ -21,4 +21,7 @@
     <Reference Include="UnityEngine.CoreModule"><HintPath>$(UnityManaged)/UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.AudioModule"><HintPath>$(UnityManaged)/UnityEngine.AudioModule.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../IOSPort.Compat/IOSPort.Compat.csproj" />
+  </ItemGroup>
 </Project>

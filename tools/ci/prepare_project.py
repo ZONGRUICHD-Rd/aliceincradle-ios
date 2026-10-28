@@ -42,8 +42,9 @@ PACKAGE_ASSEMBLIES = [
 # Windows-only assemblies nothing needs once SFB is replaced.
 REMOVE_ASSEMBLIES = ["Ookii.Dialogs", "System.Windows.Forms"]
 
-# Our managed replacements (built from /managed).
-REPLACED_ASSEMBLIES = ["CriMw.CriWare.Runtime", "SFB"]
+# Our managed assemblies (built from /managed): replacements for CRIWARE and
+# SFB, plus IOSPort.Compat which the patched game assemblies call into.
+OUR_ASSEMBLIES = ["CriMw.CriWare.Runtime", "SFB", "IOSPort.Compat"]
 
 
 def log(msg):
@@ -183,12 +184,12 @@ def main():
     # 3. plugins -------------------------------------------------------------
     plugins = os.path.join(assets, "Plugins")
     os.makedirs(plugins, exist_ok=True)
-    for name in REPLACED_ASSEMBLIES:
+    for name in OUR_ASSEMBLIES:
         src = os.path.join(a.dlls, name + ".dll")
         if not os.path.exists(src):
-            sys.exit("missing replacement assembly " + src)
+            sys.exit("missing assembly " + src)
         shutil.copy2(src, os.path.join(plugins, name + ".dll"))
-        log("replaced %s.dll" % name)
+        log("installed %s.dll" % name)
     for name in REMOVE_ASSEMBLIES:
         for ext in (".dll", ".dll.meta"):
             p = os.path.join(plugins, name + ext)
@@ -267,13 +268,14 @@ def main():
     log("moved %d bundle manifests, removed Windows bundles" % nb)
     debug = os.path.join(sa, "_debug.txt")
     if os.path.exists(debug):
-        with open(debug, encoding="utf-8") as f:
+        # newline="": keep the file's own line endings (the runner is Windows)
+        with open(debug, encoding="utf-8", newline="") as f:
             text = f.read()
         # iOS: use the game's pixel shader fallback instead of compute shaders
         text = re.sub(r"(?m)^nocomputeshader\s+\d+", "nocomputeshader 1", text)
         if "nocomputeshader" not in text:
             text += "\nnocomputeshader 1\n"
-        with open(debug, "w", encoding="utf-8") as f:
+        with open(debug, "w", encoding="utf-8", newline="") as f:
             f.write(text)
     sha = os.path.join(sa, "_sha.txt")
     if os.path.exists(sha):

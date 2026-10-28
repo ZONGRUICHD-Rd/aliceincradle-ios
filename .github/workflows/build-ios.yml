@@ -68,11 +68,21 @@ jobs:
           $curl = @('-fL', '--no-progress-meter', '--retry', '5', '--retry-all-errors', '--retry-delay', '5',
                     '--connect-timeout', '30', '--speed-limit', '1024', '--speed-time', '60')
           $zip = Join-Path $env:RUNNER_TEMP 'source.zip'
+          $token = @('-H', "Authorization: Bearer $env:GITHUB_TOKEN")
+          # codeload serves public repositories; the authenticated API zipball
+          # (a redirect to a signed codeload URL) also covers private ones
+          $sources = @(
+            @{ url = "https://codeload.github.com/$repo/zip/$sha"; auth = @() },
+            @{ url = "https://api.github.com/repos/$repo/zipball/$sha"; auth = $token }
+          )
           $ok = $false
-          for ($i = 1; $i -le 4 -and -not $ok; $i++) {
-            Write-Host "codeload attempt $i"
-            & curl.exe @curl -m 600 -o $zip "https://codeload.github.com/$repo/zip/$sha"
-            $ok = $LASTEXITCODE -eq 0
+          for ($i = 1; $i -le 3 -and -not $ok; $i++) {
+            foreach ($src in $sources) {
+              Write-Host "source zip attempt ${i}: $($src.url)"
+              $auth = $src.auth
+              & curl.exe @curl @auth -m 600 -o $zip $src.url
+              if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            }
             if (-not $ok) { Start-Sleep -Seconds (10 * $i) }
           }
           if ($ok) {
@@ -83,7 +93,7 @@ jobs:
             Get-ChildItem -LiteralPath $top.FullName -Force | Move-Item -Destination $ws
             Remove-Item $tmp, $zip -Recurse -Force
           } else {
-            Write-Host 'codeload failed, fetching files from raw.githubusercontent.com'
+            Write-Host 'zip download failed, fetching the files one by one'
             $tree = Join-Path $env:RUNNER_TEMP 'tree.json'
             & curl.exe @curl -H "Authorization: Bearer $env:GITHUB_TOKEN" -o $tree "https://api.github.com/repos/$repo/git/trees/${sha}?recursive=1"
             if ($LASTEXITCODE -ne 0) { throw 'could not list repository files' }
@@ -92,7 +102,10 @@ jobs:
               $dest = Join-Path $ws ($f.path -replace '/', '\')
               New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
               $path = ($f.path -split '/' | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/'
-              & curl.exe @curl -o $dest "https://raw.githubusercontent.com/$repo/$sha/$path"
+              & curl.exe @curl -H "Authorization: token $env:GITHUB_TOKEN" -o $dest "https://raw.githubusercontent.com/$repo/$sha/$path"
+              if ($LASTEXITCODE -ne 0) {
+                & curl.exe @curl @token -H 'Accept: application/vnd.github.raw' -o $dest "https://api.github.com/repos/$repo/contents/${path}?ref=$sha"
+              }
               if ($LASTEXITCODE -ne 0) { throw "download failed: $($f.path)" }
             }
           }
@@ -203,7 +216,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           New-Item -ItemType Directory -Force "$env:WORK\refcheck" | Out-Null
           Copy-Item "$env:GAME_DATA\Managed\*.dll" "$env:WORK\refcheck\"
-          Copy-Item "$env:WORK\dlls\CriMw.CriWare.Runtime.dll", "$env:WORK\dlls\SFB.dll" "$env:WORK\refcheck\" -Force
+          Copy-Item "$env:WORK\dlls\CriMw.CriWare.Runtime.dll", "$env:WORK\dlls\SFB.dll", "$env:WORK\dlls\IOSPort.Compat.dll" "$env:WORK\refcheck\" -Force
           # every reference the game makes into the replaced assemblies must resolve
           dotnet $pt check-refs "$env:WORK\refcheck" CriMw.CriWare.Runtime Assembly-CSharp unsafeAssem
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -241,6 +254,13 @@ jobs:
           # under that name is shadowed in the editor and its MonoBehaviours get
           # built without data (crash while loading the first scene on device)
           dotnet "$env:WORK\porttool\PortTool.dll" rename-assembly "$env:WORK\unity\Assets\Plugins\Assembly-CSharp.dll" AliceInCradle.Game "$env:GAME_DATA\Managed"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $plugins = "$env:WORK\unity\Assets\Plugins"
+          # the game refuses to start unless it runs as the stock Windows player
+          dotnet "$env:WORK\porttool\PortTool.dll" skip-environment-check "$plugins\unsafeAssem.dll" "$env:GAME_DATA\Managed"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # file names in the game were written for case-insensitive Windows
+          dotnet "$env:WORK\porttool\PortTool.dll" redirect-io "$plugins\IOSPort.Compat.dll" "$plugins\AliceInCradle.Game.dll" "$plugins\unsafeAssem.dll" "$plugins\pixelliner.dll" "$plugins\better.dll" --search "$env:GAME_DATA\Managed"
           if ($LASTEXITCODE -ne 0) { exit 1 }
           # raw-IL generic comparers (Better.UnsafeGeneric) that IL2CPP cannot compile
           foreach ($d in Get-ChildItem "$env:WORK\unity\Assets\Plugins" -Filter *.dll) {

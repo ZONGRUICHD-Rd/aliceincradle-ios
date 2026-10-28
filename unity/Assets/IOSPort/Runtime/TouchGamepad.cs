@@ -42,6 +42,7 @@ namespace IOSPort
         Canvas canvas;
         RectTransform root;
         readonly List<Control> controls = new List<Control>();
+        readonly HashSet<int> activeTouches = new HashSet<int>();
         Rect lastSafeArea;
         Vector2Int lastScreen;
         Sprite circle;
@@ -110,8 +111,32 @@ namespace IOSPort
             bool physical = false;
             foreach (var d in InputSystem.devices)
                 if (d is Gamepad && d != pad) physical = true;
+            if (visible && physical) ReleaseAll();
             visible = !physical;
             root.gameObject.SetActive(visible);
+        }
+
+        /// <summary>Let go of every control and send a neutral pad state.</summary>
+        void ReleaseAll()
+        {
+            foreach (var c in controls)
+            {
+                c.touchId = -1;
+                c.stickValue = Vector2.zero;
+                c.pressed = false;
+            }
+            if (pad != null && pad.added) InputSystem.QueueStateEvent(pad, new GamepadState());
+        }
+
+        // touches can vanish without an Ended phase while the app is in the background
+        void OnApplicationFocus(bool focus)
+        {
+            if (!focus) ReleaseAll();
+        }
+
+        void OnApplicationPause(bool paused)
+        {
+            if (paused) ReleaseAll();
         }
 
         void Add(Kind kind, string label, GamepadButton button, Vector2 anchor, float radius,
@@ -196,6 +221,7 @@ namespace IOSPort
             var ts = Touchscreen.current;
             float s = Scale;
             foreach (var c in controls) c.pressed = false;
+            activeTouches.Clear();
 
             if (ts != null)
             {
@@ -204,6 +230,8 @@ namespace IOSPort
                     var phase = touch.phase.ReadValue();
                     if (phase == UnityEngine.InputSystem.TouchPhase.None) continue;
                     int id = touch.touchId.ReadValue();
+                    if (phase != UnityEngine.InputSystem.TouchPhase.Ended && phase != UnityEngine.InputSystem.TouchPhase.Canceled)
+                        activeTouches.Add(id);
                     bool ended = phase == UnityEngine.InputSystem.TouchPhase.Ended ||
                                  phase == UnityEngine.InputSystem.TouchPhase.Canceled;
                     Vector2 pos = touch.position.ReadValue();
@@ -246,6 +274,14 @@ namespace IOSPort
                     owner.pressed = true;
                 }
             }
+
+            // a control whose touch is gone (reset without an Ended phase) lets go
+            foreach (var c in controls)
+                if (c.touchId != -1 && !activeTouches.Contains(c.touchId))
+                {
+                    c.touchId = -1;
+                    c.stickValue = Vector2.zero;
+                }
 
             var state = new GamepadState();
             foreach (var c in controls)

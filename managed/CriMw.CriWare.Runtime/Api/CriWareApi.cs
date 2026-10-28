@@ -544,7 +544,10 @@ namespace CriWare
         internal static void EnsureRunning()
         {
             if (_instance != null) return;
+            // hosts the mixer and the engine update: must survive scene loads,
+            // like the server object of the native plugin
             var go = new GameObject("CRIWARE");
+            DontDestroyOnLoad(go);
             _instance = go.AddComponent<CriAtomServer>();
         }
 
@@ -590,8 +593,9 @@ namespace CriWare
         internal static string ResolvePath(string path)
         {
             if (string.IsNullOrEmpty(path)) return path;
-            if (Path.IsPathRooted(path)) return path;
-            return Path.Combine(Application.streamingAssetsPath, path);
+            if (!Path.IsPathRooted(path)) path = Path.Combine(Application.streamingAssetsPath, path);
+            // file names in the game data were written for case-insensitive Windows
+            return IOSPort.Compat.CaseIO.Resolve(path);
         }
 
         public static CriAtomCueSheet AddCueSheet(string name, string acbFile, string awbFile, CriFsBinder binder = null)

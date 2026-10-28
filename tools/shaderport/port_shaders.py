@@ -28,7 +28,7 @@ BUILTIN_PREFIXES = (
     "Hidden/Universal Render Pipeline/", "Hidden/Universal/", "Universal Render Pipeline/",
     "Hidden/Core/", "Hidden/TerrainEngine/", "Legacy Shaders/", "Sprites/",
     "UI/", "Hidden/Internal", "Skybox/", "Particles/", "Mobile/", "Unlit/",
-    "Spine/", "Fusion", "Hidden/Shadow2D", "Hidden/ShadowProjected2D",
+    "Hidden/Shadow2D", "Hidden/ShadowProjected2D",
     "Hidden/Light2D", "Hidden/Light2d", "Hidden/InternalErrorShader",
     "Hidden/BlitCopy", "Hidden/VideoDecode", "Hidden/Compositing",
     "Hidden/BlitToDepth", "Hidden/CubeBlur", "Hidden/CubeCopy",

@@ -10,27 +10,61 @@ namespace CriCompat.Engine
     {
         public string Name;
         public AcbFile Acb;
-        readonly Dictionary<int, byte[]> waveCache = new Dictionary<int, byte[]>();
-        readonly object cacheLock = new object();
+
+        // Waveform bytes of all cue sheets share one budget, least recently used
+        // first out; streamed BGM would otherwise stay in memory for good. Voices
+        // keep their own reference, so eviction never cuts a playing sound.
+        const long CacheBudget = 96L << 20;
+        static readonly object cacheLock = new object();
+        static readonly LinkedList<(CueSheetData sheet, int index)> lru = new LinkedList<(CueSheetData, int)>();
+        static long cachedBytes;
+        readonly Dictionary<int, (byte[] data, LinkedListNode<(CueSheetData, int)> node)> waveCache =
+            new Dictionary<int, (byte[], LinkedListNode<(CueSheetData, int)>)>();
 
         public byte[] GetWaveBytes(int index)
         {
             lock (cacheLock)
             {
-                if (waveCache.TryGetValue(index, out byte[] b)) return b;
+                if (waveCache.TryGetValue(index, out var hit))
+                {
+                    lru.Remove(hit.node);
+                    lru.AddFirst(hit.node);
+                    return hit.data;
+                }
             }
             if (index < 0 || index >= Acb.Waveforms.Count) return null;
             byte[] data = Acb.ReadWaveformData(Acb.Waveforms[index]);
+            if (data == null) return null;
             lock (cacheLock)
             {
-                waveCache[index] = data;
+                if (waveCache.TryGetValue(index, out var raced)) return raced.data;
+                waveCache[index] = (data, lru.AddFirst((this, index)));
+                cachedBytes += data.Length;
+                while (cachedBytes > CacheBudget && lru.Count > 1)
+                {
+                    var (sheet, idx) = lru.Last.Value;
+                    lru.RemoveLast();
+                    if (sheet.waveCache.TryGetValue(idx, out var old))
+                    {
+                        sheet.waveCache.Remove(idx);
+                        cachedBytes -= old.data.Length;
+                    }
+                }
             }
             return data;
         }
 
         public void Release()
         {
-            lock (cacheLock) waveCache.Clear();
+            lock (cacheLock)
+            {
+                foreach (var e in waveCache.Values)
+                {
+                    lru.Remove(e.node);
+                    cachedBytes -= e.data.Length;
+                }
+                waveCache.Clear();
+            }
             Acb.Close();
         }
     }
@@ -674,7 +708,10 @@ namespace CriCompat.Engine
         {
             int next = NaturalNextBlock(pb);
             if (pb.PreparedFor == pb.BlockSerial && next == pb.PreparedNext) return;
-            if (pb.Time >= pb.CurBlockEnd) return; // boundary passed, audio thread handles it
+            // The audio thread only switches to a block prepared here. If this runs
+            // late (a long frame, a scene load) the boundary has already passed:
+            // switch now instead of leaving the playback without a next block.
+            if (pb.Time >= pb.CurBlockEnd) pb.CurBlockEnd = pb.Time;
             // remove previously prepared voices for the next block
             if (pb.PreparedFor == pb.BlockSerial && pb.PreparedNext >= 0)
             {

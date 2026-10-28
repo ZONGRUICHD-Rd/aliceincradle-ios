@@ -23,6 +23,29 @@ BUILTIN_CBUFFERS = {"UnityPerDraw", "UnityPerFrame", "UnityPerCamera",
                     "UnityMetaPass", "UnityLightingSettings"}
 
 
+
+_FILTERS = {0: "Point", 1: "Linear", 2: "Trilinear"}
+_WRAPS = {0: "Repeat", 1: "Clamp", 2: "Mirror", 3: "MirrorOnce"}
+
+
+def inline_sampler_name(state, compare=False):
+    """Name of an inline sampler from Unity's packed sampler state.
+
+    bits 0-1 filter, 2-3 / 4-5 / 6-7 wrap mode of U / V / W; checked against
+    URP's sampler_PointClamp (84), sampler_LinearClamp (85),
+    sampler_PointRepeat (0) and sampler_LinearRepeat (1).
+    """
+    if isinstance(state, str):
+        return state
+    state = int(state)
+    flt = _FILTERS.get(state & 3, "Linear")
+    wu, wv, ww = (state >> 2) & 3, (state >> 4) & 3, (state >> 6) & 3
+    if wu == wv == ww:
+        wrap = _WRAPS[wu]
+    else:
+        wrap = "%sU_%sV_%sW" % (_WRAPS[wu], _WRAPS[wv], _WRAPS[ww])
+    return "sampler_%s%s%s" % (flt, wrap, "Compare" if compare else "")
+
 class TranslateError(Exception):
     pass
 
@@ -398,9 +421,8 @@ class Translator:
     def sampler_name(self, op):
         slot = op.indices[0][0]
         if slot in self.b.samplers:
-            nm = self.b.samplers[slot]
-            if not isinstance(nm, str):
-                nm = "sampler%d" % slot
+            # inline sampler state: Unity derives it from the sampler's name
+            nm = inline_sampler_name(self.b.samplers[slot], self.sampler_modes.get(slot) == 1)
         else:
             nm = None
             for tslot, (tname, _d, sslot, _ms) in self.b.textures.items():

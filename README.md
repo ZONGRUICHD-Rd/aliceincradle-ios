@@ -15,6 +15,8 @@ GitHub Actions 会下载游戏原始文件，重建 Unity 工程，以 **Metal +
 | 文件对话框 | SFB（user32/Windows Forms） | `managed/SFB` 空实现（仅影响小游戏的导入/导出功能） |
 | 计算着色器 | 部分效果使用 compute shader | 打开游戏自带的 `nocomputeshader` 开关，走游戏内置的像素着色器回退路径 |
 | 输入 | 键盘 / 手柄 | 触屏虚拟手柄（`unity/Assets/IOSPort/Runtime/TouchGamepad.cs`），映射为 Input System 的虚拟 Gamepad，游戏原有手柄键位直接生效；连接实体手柄（MFi/Xbox/PS）时自动隐藏 |
+| 启动环境检查 | `XX.IN.Awake` 会计算 Windows 版 exe 的 SHA1、核对 Unity 版本，并拦截安卓模拟器；iOS 上没有 exe，游戏停在启动阶段（灰屏） | `PortTool skip-environment-check` 跳过这一段检查，其余启动流程不变 |
+| 文件名大小写 | Windows 不区分大小写（还有反斜杠路径），iOS 区分 | `managed/IOSPort.Compat` 提供按真实文件名解析路径的 `GameIO`；`PortTool redirect-io` 把游戏里的 `File.Exists`、`FileStream`、`AssetBundle.LoadFromFile` 等调用改为调用它 |
 | 程序集名 | 游戏主程序集名为 `Assembly-CSharp`，与 Unity 保留名冲突，编辑器无法解析其中的脚本，场景数据被写成空组件，真机启动即崩溃 | `PortTool rename-assembly` 改名为 `AliceInCradle.Game`（保留 GUID，引用不变）；构建前检查场景中是否有丢失的脚本 |
 | IL2CPP | 原版是 Mono，`Better.UnsafeGeneric.dll` 用手写 IL 直接比较泛型枚举值，IL2CPP 无法编译 | `PortTool fix-generic-comparers` 把这些方法改写为调用 `EqualityComparer<T>.Default`，结果相同 |
 | Unity 包 | 导出为预编译 DLL | `tools/PortTool` 把场景/资源中对 URP、Input System、UGUI 脚本的引用重映射到真正的 UPM 包源码 |
@@ -56,8 +58,9 @@ GitHub macos-26 (job: ipa)
 - `.github/workflows/build-ios.yml` — CI
 - `managed/CriMw.CriWare.Runtime` — CRIWARE 托管替代实现
 - `managed/SFB` — 文件对话框替代实现
+- `managed/IOSPort.Compat` — 游戏文件访问的大小写兼容层
 - `tools/shaderport` — DXBC → HLSL/ShaderLab 转换器
-- `tools/PortTool` — 脚本引用重映射 / 引用校验
+- `tools/PortTool` — 脚本引用重映射、引用校验、程序集补丁（改名、跳过环境检查、文件访问重定向、泛型比较器）
 - `tools/ci` — 压缩包重组、AssetRipper、项目合并、Unity 定位/运行脚本（PowerShell / Python）
 - `unity/` — iOS Unity 工程骨架（编辑器构建脚本、触屏控制、启动设置）
 
